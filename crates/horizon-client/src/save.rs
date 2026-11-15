@@ -444,27 +444,9 @@ pub fn migrate_legacy(world: &Path) -> Result<()> {
 /// once. The originals move to `mca-backup/` inside each dimension. Worlds
 /// already converted have no `.mca` left and are not touched.
 pub fn convert_linear(world: &Path) -> Result<()> {
-    let Ok(namespaces) = fs::read_dir(world.join("dimensions")) else {
-        return Ok(());
-    };
-    for namespace in namespaces {
-        let namespace = namespace?.path();
-        if !namespace.is_dir() {
-            continue;
-        }
-        for dimension in fs::read_dir(&namespace)? {
-            let dimension = dimension?.path();
-            if !dimension.is_dir() {
-                continue;
-            }
-            let converted = linear::convert_dimension(&dimension, linear::DEFAULT_LEVEL)?;
-            if converted > 0 {
-                log::info!(
-                    "converted {converted} region file(s) to linear in {}",
-                    dimension.display()
-                );
-            }
-        }
+    let converted = linear::convert_world(world, linear::DEFAULT_LEVEL)?;
+    if converted > 0 {
+        log::info!("converted {converted} region file(s) to linear in {}", world.display());
     }
     Ok(())
 }

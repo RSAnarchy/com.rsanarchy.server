@@ -155,6 +155,20 @@ fn prepare_world(shared: &Arc<Shared>, dir: &Path, config: &Config) -> Result<()
             &format!("Chunk prune failed, the server starts without the rest of it: {e}"),
         );
     }
+    // One-time Anvil (.mca) to linear conversion, before any engine opens the world. Runs after the
+    // prune above, which still reads .mca. A failure stops the start: the .mca stays where it was.
+    let converted = horizon_platform::world::linear::convert_world(
+        &world,
+        horizon_platform::world::linear::DEFAULT_LEVEL,
+    )
+    .map_err(|e| format!("could not convert the world to linear regions: {e}"))?;
+    if converted > 0 {
+        note(
+            shared,
+            "INFO",
+            &format!("Converted {converted} region file(s) to linear; the .mca originals are in mca-backup/"),
+        );
+    }
     Ok(())
 }
 

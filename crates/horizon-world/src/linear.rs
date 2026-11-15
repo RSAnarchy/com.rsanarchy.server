@@ -593,3 +593,26 @@ pub fn convert_dimension(dimension_dir: &Path, level: i8) -> io::Result<usize> {
     }
     Ok(converted)
 }
+
+/// Convert every dimension of the world at `world` (`dimensions/<namespace>/<name>`)
+/// with [`convert_dimension`]. Returns the total number of regions converted. Worlds
+/// with no `.mca` left return 0 and are not modified.
+pub fn convert_world(world: &Path, level: i8) -> io::Result<usize> {
+    let Ok(namespaces) = fs::read_dir(world.join("dimensions")) else {
+        return Ok(0);
+    };
+    let mut converted = 0;
+    for namespace in namespaces {
+        let namespace = namespace?.path();
+        if !namespace.is_dir() {
+            continue;
+        }
+        for dimension in fs::read_dir(&namespace)? {
+            let dimension = dimension?.path();
+            if dimension.is_dir() {
+                converted += convert_dimension(&dimension, level)?;
+            }
+        }
+    }
+    Ok(converted)
+}

@@ -30,7 +30,7 @@ pub use horizon_core::prepared_files;
 #[cfg(feature = "world")]
 pub mod world {
     pub use horizon_core::position::ChunkPos;
-    pub use horizon_world::{compression, nbt, region};
+    pub use horizon_world::{compression, linear, nbt, region};
 }
 
 /// What a server list and a profile head need of the network protocol.
