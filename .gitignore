@@ -1,0 +1,15 @@
+/target/
+# Downloaded/decompiled game content and private profiling artifacts.
+*.jar
+*.class
+*.jfr
+*.hprof
+/decompiled/
+/minecraft/
+/run/
+/logs/
+/saves/
+/backups/
+.DS_Store
+/crash-reports/
+/debug/
