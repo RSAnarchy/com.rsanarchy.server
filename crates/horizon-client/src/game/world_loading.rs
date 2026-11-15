@@ -155,7 +155,6 @@ impl WorldRequest {
         }
         horizon_client::save::upgrade_older_world_with(&save_root, upgrade)?;
         horizon_client::save::migrate_legacy(&save_root)?;
-        horizon_client::save::convert_linear(&save_root)?;
         let session_lock = horizon_client::save::SessionLock::acquire(&save_root)?;
         // RandomSequences: the world's data/minecraft/random_sequences.dat.
         let rand_sequences = super::trading::read_random_sequences(&save_root);

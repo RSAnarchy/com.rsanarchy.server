@@ -551,47 +551,172 @@ pub const REGION_FOLDERS: [&str; 3] = ["region", "entities", "poi"];
 /// Name of the folder that keeps the `.mca` originals after conversion.
 pub const MCA_BACKUP_DIR: &str = "mca-backup";
 
-/// Convert every `.mca` in one dimension directory to `.linear`, then move the
-/// `.mca` into `mca-backup/<folder>/`. A `.mca` whose `.linear` already exists
-/// is only moved, so an interrupted run resumes cleanly. Returns the number of
-/// regions converted.
-///
-/// Any failure returns an error and leaves the failing `.mca` in place, so the
-/// caller can refuse to open the world rather than run on a partial copy.
-pub fn convert_dimension(dimension_dir: &Path, level: i8) -> io::Result<usize> {
-    let mut converted = 0;
-    for folder in REGION_FOLDERS {
-        let dir = dimension_dir.join(folder);
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries {
-            let path = entry?.path();
-            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            let Some(stem) = name.strip_suffix(".mca") else {
-                continue;
-            };
-            if !path.is_file() || crate::region::position_from_path(&path).is_err() {
-                continue;
+/// Folder that keeps a `.linear` file which would not open, set aside before its
+/// region is rebuilt from the `.mca` original. Nothing in it is read again.
+pub const CORRUPT_DIR: &str = "linear-corrupt";
+
+/// Whether `path` is a `.linear` file that opens and parses.
+fn opens(path: &Path) -> bool {
+    LinearRegionFile::open(path).is_ok()
+}
+
+/// Write `source` (an `.mca`) to `linear`, then check that the file opens and has as many
+/// chunks as were written. A failed check removes the new file and returns the error.
+fn convert_checked(source: &Path, linear: &Path, level: i8) -> io::Result<usize> {
+    let written = convert_mca(source, linear, level)?;
+    let check = LinearRegionFile::open(linear).and_then(|file| {
+        let count = file.chunks().count();
+        if count == written {
+            Ok(())
+        } else {
+            Err(invalid(format!(
+                "converted {} has {count} chunks, expected {written}",
+                linear.display()
+            )))
+        }
+    });
+    if let Err(e) = check {
+        let _ = fs::remove_file(linear);
+        return Err(e);
+    }
+    Ok(written)
+}
+
+/// Fill in the chunks of `source` (an `.mca`) that `linear` does not have, keeping every chunk
+/// `linear` already has: those were saved by the engine and are newer than the original.
+/// Returns how many chunks were added, and checks the file opens with the expected count.
+fn import_missing(linear: &Path, source: &Path) -> io::Result<usize> {
+    let mut file = LinearRegion::open(linear, false)?;
+    let before = file.chunks().count();
+    let mut original = RegionFile::open(source)?;
+    let present: Vec<ChunkPos> = original.chunks().map(|(pos, _)| pos).collect();
+    let mut added = 0;
+    for pos in present {
+        if file.read(pos)?.is_none() {
+            if let Some(record) = original.read(pos)? {
+                file.write(pos, &record)?;
+                added += 1;
             }
-            let linear = dir.join(format!("{stem}.linear"));
-            if !linear.exists() {
-                convert_mca(&path, &linear, level).map_err(|e| {
-                    io::Error::new(
-                        e.kind(),
-                        format!("could not convert {}: {e}", path.display()),
-                    )
-                })?;
-                converted += 1;
-            }
-            let backup = dimension_dir.join(MCA_BACKUP_DIR).join(folder);
-            fs::create_dir_all(&backup)?;
-            fs::rename(&path, backup.join(name))?;
         }
     }
-    Ok(converted)
+    if added == 0 {
+        return Ok(0);
+    }
+    file.sync()?;
+    let after = LinearRegionFile::open(linear)?.chunks().count();
+    if after != before + added {
+        return Err(invalid(format!(
+            "{} has {after} chunks after importing {added}, expected {}",
+            linear.display(),
+            before + added
+        )));
+    }
+    Ok(added)
+}
+
+/// Bring one dimension to linear: every region, entity and poi file ends up as a `.linear`
+/// that opens, and its `.mca` original is moved to `mca-backup/<folder>/`.
+///
+/// For each region name, in order:
+/// - a `.linear` that opens is kept as it is;
+/// - a `.linear` that does not open is moved to `linear-corrupt/<folder>/` and rebuilt from the
+///   `.mca` original, found in the region folder or in `mca-backup/`;
+/// - a `.linear` that is missing is built from the `.mca` original the same way.
+///
+/// A `.mca` still in the region folder is then moved into `mca-backup/`. A name with no
+/// readable original and no `.linear` that opens is an error: the file is left where it is, and
+/// the world does not open rather than run on a region with no good copy. Returns the number of
+/// `.linear` files built.
+pub fn convert_dimension(dimension_dir: &Path, level: i8) -> io::Result<usize> {
+    let mut built = 0;
+    for folder in REGION_FOLDERS {
+        let dir = dimension_dir.join(folder);
+        let backup = dimension_dir.join(MCA_BACKUP_DIR).join(folder);
+        // Every region name present as .mca, in the folder or in its backup.
+        let mut names: std::collections::BTreeSet<String> = Default::default();
+        for source_dir in [&dir, &backup] {
+            let Ok(entries) = fs::read_dir(source_dir) else {
+                continue;
+            };
+            for entry in entries {
+                let path = entry?.path();
+                let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                if name.strip_suffix(".mca").is_some()
+                    && path.is_file()
+                    && crate::region::position_from_path(&path).is_ok()
+                {
+                    names.insert(name.to_owned());
+                }
+            }
+        }
+        for name in names {
+            let stem = name.strip_suffix(".mca").unwrap_or(&name);
+            let linear = dir.join(format!("{stem}.linear"));
+            let region_mca = dir.join(&name);
+            let backup_mca = backup.join(&name);
+            // The original to rebuild from: the region folder's .mca, else the backup's.
+            let source = if region_mca.is_file() {
+                Some(region_mca.clone())
+            } else if backup_mca.is_file() {
+                Some(backup_mca.clone())
+            } else {
+                None
+            };
+            let no_original = || {
+                invalid(format!(
+                    "{} has no readable linear file and no .mca original",
+                    linear.display()
+                ))
+            };
+            let marker = backup.join(format!("{stem}.imported"));
+            let linear_was_valid = linear.exists() && opens(&linear);
+            if !linear_was_valid {
+                // Nothing is moved unless there is an original to rebuild from.
+                let source = source.clone().ok_or_else(no_original)?;
+                if linear.exists() {
+                    let corrupt = dimension_dir.join(CORRUPT_DIR).join(folder);
+                    fs::create_dir_all(&corrupt)?;
+                    log::warn!(
+                        "Horizon: {} does not open; kept as {}, rebuilt from {}",
+                        linear.display(),
+                        corrupt.join(format!("{stem}.linear")).display(),
+                        source.display()
+                    );
+                    fs::rename(&linear, corrupt.join(format!("{stem}.linear")))?;
+                }
+                convert_checked(&source, &linear, level).map_err(|e| {
+                    io::Error::new(
+                        e.kind(),
+                        format!("could not convert {}: {e}", source.display()),
+                    )
+                })?;
+                built += 1;
+            }
+            if let Some(source) = &source {
+                fs::create_dir_all(&backup)?;
+                if !marker.exists() {
+                    if linear_was_valid {
+                        let added = import_missing(&linear, source)?;
+                        if added > 0 {
+                            log::warn!(
+                                "Horizon: imported {added} chunk(s) from {} into {}",
+                                source.display(),
+                                linear.display()
+                            );
+                        }
+                    }
+                    fs::write(&marker, b"")?;
+                }
+            }
+            if region_mca.is_file() {
+                fs::create_dir_all(&backup)?;
+                fs::rename(&region_mca, &backup_mca)?;
+            }
+        }
+    }
+    Ok(built)
 }
 
 /// Convert every dimension of the world at `world` (`dimensions/<namespace>/<name>`)

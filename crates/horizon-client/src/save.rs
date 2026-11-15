@@ -61,8 +61,6 @@ use std::{
 pub const VERSION_NAME: &str = horizon_core::VANILLA_VERSION;
 
 #[cfg(test)]
-use horizon_world::region::RegionFile;
-#[cfg(test)]
 mod compression_bench;
 mod compression_pool;
 #[cfg(test)]
@@ -436,17 +434,6 @@ pub fn migrate_legacy(world: &Path) -> Result<()> {
         if !old.is_empty() && from.is_dir() && fs::read_dir(&from)?.next().is_none() {
             let _ = fs::remove_dir(&from);
         }
-    }
-    Ok(())
-}
-
-/// Convert a world's Anvil (`.mca`) region, entity and poi files to `.linear`,
-/// once. The originals move to `mca-backup/` inside each dimension. Worlds
-/// already converted have no `.mca` left and are not touched.
-pub fn convert_linear(world: &Path) -> Result<()> {
-    let converted = linear::convert_world(world, linear::DEFAULT_LEVEL)?;
-    if converted > 0 {
-        log::info!("converted {converted} region file(s) to linear in {}", world.display());
     }
     Ok(())
 }
@@ -2133,7 +2120,7 @@ const MAX_OPEN_REGIONS: usize = 256;
 /// with when each was last asked for.
 #[derive(Default)]
 struct RegionFiles {
-    regions: HashMap<(i32, i32), (Option<Arc<Mutex<LinearRegion>>>, u64)>,
+    regions: HashMap<(i32, i32), (Option<Arc<Mutex<RegionFile>>>, u64)>,
     clock: u64,
     /// Each region's write stamp (`far_regions::writing`).
     written: HashMap<(i32, i32), u64>,
@@ -2176,7 +2163,7 @@ fn cached_region(
     key: (i32, i32),
     path: &Path,
     create: bool,
-) -> Result<Option<Arc<Mutex<LinearRegion>>>> {
+) -> Result<Option<Arc<Mutex<RegionFile>>>> {
     let mut cache = cache.lock().map_err(|_| "region cache poisoned")?;
     cache.clock += 1;
     let now = cache.clock;
@@ -2191,7 +2178,13 @@ fn cached_region(
         fs::create_dir_all(parent)?;
     }
     // A file this process can't write (a read-only world) is still read.
-    let region = match LinearRegion::open(path, create) {
+    let region = match RegionFile::open_writable(path, create) {
+        Err(e) if !create && e.kind() == std::io::ErrorKind::PermissionDenied => {
+            RegionFile::open(path)
+        }
+        other => other,
+    };
+    let region = match region {
         Ok(r) => Some(Arc::new(Mutex::new(r))),
         Err(_) if !create => None,
         Err(e) => return Err(e.into()),
@@ -2300,7 +2293,7 @@ fn share_out<R: Send>(
 }
 
 fn region_path(root: &Path, folder: &str, rx: i32, rz: i32) -> PathBuf {
-    root.join(format!("{folder}/r.{rx}.{rz}.linear"))
+    root.join(format!("{folder}/r.{rx}.{rz}.mca"))
 }
 
 /// A record waiting for the writer thread.
@@ -2733,7 +2726,7 @@ impl SaveDir {
     /// before DataVersion 4997, or with `blending_data`.
     pub fn old_chunk_bits(&self, rx: i32, rz: i32) -> [u64; 16] {
         let mut bits = [0u64; 16];
-        let Ok(region) = LinearRegion::open(self.region_path("region", rx, rz), false) else {
+        let Ok(region) = RegionFile::open(self.region_path("region", rx, rz)) else {
             return bits;
         };
         let present: Vec<ChunkPos> = region.chunks().map(|(pos, _)| pos).collect();

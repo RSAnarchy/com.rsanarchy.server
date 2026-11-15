@@ -281,7 +281,7 @@ CREATE TABLE IF NOT EXISTS ignores (
 ) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS homes (
     owner BLOB NOT NULL,
-    name TEXT NOT NULL,
+    name TEXT NOT NULL COLLATE NOCASE,
     dim TEXT NOT NULL,
     x REAL NOT NULL,
     y REAL NOT NULL,
@@ -711,8 +711,63 @@ impl Store {
         conn.pragma_update(None, "synchronous", "NORMAL").map_err(err)?;
         conn.execute_batch(SCHEMA).map_err(err)?;
         let store = Self { conn };
+        store.migrate_home_names()?;
         store.migrate_legacy();
         Ok(store)
+    }
+
+    /// Home names match without regard to case: a database made before the column was
+    /// `COLLATE NOCASE` is rebuilt with it, once (`user_version` 1). Where two names differ only
+    /// by case, the first (in name order) is kept and the other is logged, not dropped silently.
+    fn migrate_home_names(&self) -> Result<(), String> {
+        let err = |e: rusqlite::Error| e.to_string();
+        let version: i64 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(err)?;
+        if version >= 1 {
+            return Ok(());
+        }
+        let before: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM homes", [], |row| row.get(0))
+            .map_err(err)?;
+        self.conn
+            .execute_batch(
+                "BEGIN;
+                 CREATE TABLE homes_nocase (
+                     owner BLOB NOT NULL,
+                     name TEXT NOT NULL COLLATE NOCASE,
+                     dim TEXT NOT NULL,
+                     x REAL NOT NULL,
+                     y REAL NOT NULL,
+                     z REAL NOT NULL,
+                     yaw REAL NOT NULL,
+                     pitch REAL NOT NULL,
+                     PRIMARY KEY (owner, name)
+                 ) WITHOUT ROWID;
+                 INSERT OR IGNORE INTO homes_nocase
+                     SELECT owner, name, dim, x, y, z, yaw, pitch FROM homes ORDER BY name;
+                 DROP TABLE homes;
+                 ALTER TABLE homes_nocase RENAME TO homes;
+                 PRAGMA user_version = 1;
+                 COMMIT;",
+            )
+            .map_err(err)?;
+        let after: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM homes", [], |row| row.get(0))
+            .map_err(err)?;
+        if after != before {
+            dedicated::log(
+                "WARN",
+                &format!(
+                    "{} home(s) had a name that differed from another only by case and were not kept",
+                    before - after
+                ),
+            );
+        }
+        Ok(())
     }
 
     /// Moves a `passwords.json` from before the database into it, once, and

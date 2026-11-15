@@ -14,7 +14,7 @@
 //! writer goes through (`writing`), and a far read uses a kept header only
 //! where the stamp says that nothing was written since it was read.
 use super::*;
-use horizon_world::linear::LinearRegionFile;
+use horizon_world::region::RegionHeader;
 use std::time::{Duration, Instant};
 
 /// How long a far read trusts a kept header that this process did not write
@@ -29,7 +29,7 @@ const KEPT_HEADERS: usize = 256;
 struct FarRegion {
     checked: Instant,
     written: u64,
-    header: Option<Arc<LinearRegionFile>>,
+    header: Option<Arc<RegionHeader>>,
 }
 
 #[derive(Default)]
@@ -79,7 +79,7 @@ impl FarRegions {
                     if regions.len() >= KEPT_HEADERS {
                         regions.retain(|_, kept| kept.checked.elapsed() < HEADER_TTL);
                     }
-                    let header = LinearRegionFile::open(path()).ok().map(Arc::new);
+                    let header = RegionHeader::read(path()).ok().map(Arc::new);
                     let kept = FarRegion {
                         checked: Instant::now(),
                         written,
@@ -90,7 +90,7 @@ impl FarRegions {
                 }
             }
         };
-        header?.read(chunk).ok()?
+        header?.read_chunk(chunk).ok()?
     }
 }
 
