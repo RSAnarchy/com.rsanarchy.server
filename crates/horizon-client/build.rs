@@ -1,5 +1,7 @@
 //! Generates the native mod API, and gives the Windows executable Horizon's icon and its stack
-//! (`packaging/windows/exe.rs`, shared with the official executable's build script).
+//! (`packaging/windows/exe.rs`, shared with the official executable's build script). Only the
+//! Windows build compiles that file, so Linux builds don't need the packaging folder.
+#[cfg(windows)]
 #[path = "../../packaging/windows/exe.rs"]
 mod windows_exe;
 
@@ -35,5 +37,6 @@ fn main() {
     if let Some(found) = horizon_mod_api_gen::mob_turn(&root) {
         println!("cargo:rustc-env=HORIZON_MOB_TURN={found}");
     }
+    #[cfg(windows)]
     windows_exe::resources("horizon-client");
 }

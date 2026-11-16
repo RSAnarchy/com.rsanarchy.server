@@ -33,12 +33,24 @@
 #requires -Version 7
 [CmdletBinding()]
 param(
-    [string]$Repo = (Split-Path -Parent $PSScriptRoot),
+    [string]$Repo,
     [string]$Install = (Join-Path $HOME "rsanarchy/server-runtime"),
     [switch]$SkipPackages
 )
 
 $ErrorActionPreference = "Stop"
+
+# $PSScriptRoot is empty when the script is pasted into a session, so it can't be used in a
+# parameter default. Find the repository in the body instead: the parent of this script's folder
+# when run from a file, else the current folder. -Repo overrides both.
+if (-not $Repo) {
+    $candidates = @()
+    if ($PSScriptRoot) { $candidates += (Split-Path -Parent $PSScriptRoot) }
+    $candidates += (Get-Location).Path
+    $Repo = $candidates | Where-Object { $_ -and (Test-Path -LiteralPath (Join-Path $_ "Cargo.toml")) } | Select-Object -First 1
+    if (-not $Repo) { throw "Could not find the repository (no Cargo.toml). Run from the repository folder, or pass -Repo <path>." }
+}
+$Repo = (Resolve-Path -LiteralPath $Repo).Path
 $MinRustMajor = 1
 $MinRustMinor = 95
 $Binaries = @("horizon-server", "horizon-client")
