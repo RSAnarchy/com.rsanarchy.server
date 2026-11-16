@@ -5,12 +5,13 @@
 //! `horizon_server_files::chat_guard` hook, before it relays a player's text, and carries out what it decides.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 mod normalise;
+mod spam;
 
-use horizon_server_files::chat_guard::{self, ChatGuard, Loaded, Place};
+use horizon_server_files::chat_guard::{self, ChatGuard, Loaded, Place, Screen, ScreenKind};
 pub use horizon_server_files::chat_guard::{Action, Mute};
 pub use horizon_server_files::duration::{
     DurationUnit, duration_parts, duration_text, now_millis, parse_duration,
@@ -40,6 +41,20 @@ pub struct Config {
     pub words_file: String,
     /// Every refused text with the player and what followed, relative to the server's folder.
     pub log: String,
+    /// The advert and spam screen (adverts and links, and messages sent too fast or repeated). On by
+    /// default, and separate from the slur list: single words and swears are never stopped by it.
+    pub spam_protection: bool,
+    /// More than `flood_messages` texts within `flood_seconds` is spam; the text over the limit isn't relayed.
+    pub flood_messages: u32,
+    pub flood_seconds: u32,
+    /// The same text sent `repeat_messages` times within `repeat_seconds` is spam.
+    pub repeat_messages: u32,
+    pub repeat_seconds: u32,
+    /// The screen's hits within `silent_window_minutes` that give a silent mute of `silent_minutes`;
+    /// 0 for `silent_after`: never.
+    pub silent_after: u32,
+    pub silent_window_minutes: u32,
+    pub silent_minutes: u32,
 }
 
 impl Default for Config {
@@ -53,6 +68,14 @@ impl Default for Config {
             tempban_hours: 24,
             words_file: String::new(),
             log: "logs/chat-filter.log".into(),
+            spam_protection: true,
+            flood_messages: 5,
+            flood_seconds: 5,
+            repeat_messages: 3,
+            repeat_seconds: 30,
+            silent_after: 3,
+            silent_window_minutes: 10,
+            silent_minutes: 60,
         }
     }
 }
@@ -81,6 +104,9 @@ impl Config {
     pub fn check(&self) -> Result<(), String> {
         if self.window_minutes == 0 {
             return Err("chat_filter.window_minutes must be 1 or more".into());
+        }
+        if self.flood_seconds == 0 || self.repeat_seconds == 0 || self.silent_window_minutes == 0 {
+            return Err("chat_filter: flood_seconds, repeat_seconds and silent_window_minutes must be 1 or more".into());
         }
         Ok(())
     }
@@ -233,6 +259,8 @@ struct SavedMute {
     by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    silent: bool,
 }
 
 impl From<SavedMute> for Mute {
@@ -243,6 +271,7 @@ impl From<SavedMute> for Mute {
             until,
             by,
             reason,
+            silent,
         } = m;
         Mute {
             uuid,
@@ -250,6 +279,7 @@ impl From<SavedMute> for Mute {
             until,
             by,
             reason,
+            silent,
         }
     }
 }
@@ -262,6 +292,7 @@ impl From<Mute> for SavedMute {
             until,
             by,
             reason,
+            silent,
         } = m;
         SavedMute {
             uuid,
@@ -269,6 +300,7 @@ impl From<Mute> for SavedMute {
             until,
             by,
             reason,
+            silent,
         }
     }
 }
@@ -290,6 +322,9 @@ pub struct Guard {
     pub config: Config,
     pub filter: Filter,
     strikes: HashMap<u128, Strikes>,
+    /// The advert and spam screen's hits, and each player's recent texts (time, text), kept for the spam limits.
+    screen_hits: HashMap<u128, Strikes>,
+    history: HashMap<u128, VecDeque<(i64, String)>>,
     mutes: HashMap<u128, Mute>,
     /// Where the mutes are kept; `None` keeps them in memory only (tests).
     file: Option<PathBuf>,
@@ -313,6 +348,8 @@ impl Guard {
             config,
             filter,
             strikes: HashMap::new(),
+            screen_hits: HashMap::new(),
+            history: HashMap::new(),
             mutes,
             file,
         }
@@ -371,6 +408,7 @@ impl Guard {
                 until,
                 by: Some(by.to_owned()),
                 reason,
+                silent: false,
             },
         );
         self.save();
@@ -413,6 +451,7 @@ impl Guard {
                         until: Some(until),
                         by: None,
                         reason: None,
+                        silent: false,
                     },
                 );
                 self.save();
@@ -422,6 +461,82 @@ impl Guard {
             Action::Refused
         };
         (count, action)
+    }
+
+    /// The advert and spam screen, for a text the word list let through: what it breaks, if anything,
+    /// and what follows. Each hit is numbered within `silent_window_minutes`; the hit that reaches
+    /// `silent_after` gives a silent mute of `silent_minutes` (an operator's longer mute stays).
+    pub fn screen(&mut self, uuid: u128, name: &str, text: &str, now: i64) -> Option<Screen> {
+        if !self.config.spam_protection {
+            return None;
+        }
+        let kind = self.breach(uuid, text, now)?;
+        let c = &self.config;
+        let window = i64::from(c.silent_window_minutes) * MINUTE;
+        let s = self.screen_hits.entry(uuid).or_insert(Strikes {
+            count: 0,
+            counts_until: 0,
+        });
+        if now > s.counts_until {
+            s.count = 0;
+        }
+        s.count += 1;
+        s.counts_until = now + window;
+        let count = s.count;
+        let action = if c.silent_after > 0 && count >= c.silent_after {
+            let until = now + i64::from(c.silent_minutes) * MINUTE;
+            self.screen_hits.remove(&uuid);
+            if !self
+                .mutes
+                .get(&uuid)
+                .is_some_and(|m| m.until.is_none_or(|u| u >= until))
+            {
+                self.mutes.insert(
+                    uuid,
+                    Mute {
+                        uuid: uuid_string(uuid),
+                        name: name.to_owned(),
+                        until: Some(until),
+                        by: None,
+                        reason: None,
+                        silent: true,
+                    },
+                );
+                self.save();
+            }
+            Action::Silenced { until }
+        } else {
+            Action::Refused
+        };
+        Some(Screen { kind, count, action })
+    }
+
+    /// What the text breaks, if anything. The text is recorded for the player first, so every text
+    /// counts towards the spam limits, allowed or not.
+    fn breach(&mut self, uuid: u128, text: &str, now: i64) -> Option<ScreenKind> {
+        let c = &self.config;
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+        let keep = i64::from(c.flood_seconds.max(c.repeat_seconds)) * 1000;
+        let history = self.history.entry(uuid).or_default();
+        history.retain(|(at, _)| *at > now - keep);
+        history.push_back((now, text.clone()));
+        while history.len() > 64 {
+            history.pop_front();
+        }
+        if spam::advertises(&text) {
+            return Some(ScreenKind::Advert);
+        }
+        let flood_since = now - i64::from(c.flood_seconds) * 1000;
+        let in_flood = history.iter().filter(|(at, _)| *at >= flood_since).count();
+        if in_flood > c.flood_messages as usize {
+            return Some(ScreenKind::Spam);
+        }
+        let repeat_since = now - i64::from(c.repeat_seconds) * 1000;
+        let repeats = history
+            .iter()
+            .filter(|(at, same)| *at >= repeat_since && *same == text)
+            .count();
+        (repeats >= c.repeat_messages as usize).then_some(ScreenKind::Spam)
     }
 
     /// Lifts a player's mute (and forgets their hits), by name; the name as muted, if they were.
@@ -480,6 +595,10 @@ impl ChatGuard for Guard {
 
     fn strike(&mut self, uuid: u128, name: &str, now: i64) -> (u32, Action) {
         Guard::strike(self, uuid, name, now)
+    }
+
+    fn screen(&mut self, uuid: u128, name: &str, text: &str, now: i64) -> Option<Screen> {
+        Guard::screen(self, uuid, name, text, now)
     }
 
     fn unmute(&mut self, name: &str) -> Option<String> {

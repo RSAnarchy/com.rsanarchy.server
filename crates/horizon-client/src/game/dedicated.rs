@@ -189,9 +189,6 @@ pub(super) fn cached_user_by_id(id: u128) -> Option<NameAndId> {
 
 /// How many players the server has ever seen (the user cache's size), for
 /// `/worldstats`. Zero without a cache (no dedicated server).
-pub(super) fn cached_user_count() -> usize {
-    USER_CACHE.lock().unwrap().as_ref().map_or(0, UserCache::count)
-}
 
 /// `server.toml`'s `[anticheat]`, beside server.properties when horizon-server runs the game; the
 /// default (on) without the file or the section, off (with an error logged) when the section is wrong.

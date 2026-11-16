@@ -255,6 +255,10 @@ impl Hub {
     /// handleChat: the acknowledgements, then the message through the
     /// sender's chain, then to everyone.
     pub(super) fn handle_chat(&mut self, i: usize, c: play::Chat, events: &mut Vec<HostEvent>) {
+        // Bot detection: a steady clip of chat from a player who is still (hub/bot_watch.rs).
+        if self.bot_chat(i, events) {
+            return;
+        }
         // The login hold (game/anarchy.rs): no chat until they authenticate.
         if self.login_hold.contains(&self.guests[i].uuid) {
             // Their acknowledgements and chain still count: the client signs each message it
@@ -440,7 +444,9 @@ impl Hub {
         let secure = message.trusted(now_millis());
         events.push(HostEvent::Chat { line, secure });
         for k in 0..self.guests.len() {
-            if self.guests[k].placed && !self.ignores(self.guests[k].uuid, message.sender) {
+            // A silently muted player is shown no one else's chat.
+            let hidden = self.silenced(self.guests[k].uuid);
+            if self.guests[k].placed && !hidden && !self.ignores(self.guests[k].uuid, message.sender) {
                 // The sender's own copy of an unsigned line goes as a system line: it reads the
                 // same, but a client that signs its chat rejects its own unsigned echo ("Chat
                 // validation error"). Its global index is not counted, as a system line has none.

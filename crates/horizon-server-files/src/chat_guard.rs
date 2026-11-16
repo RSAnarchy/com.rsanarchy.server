@@ -47,6 +47,9 @@ pub enum Action {
     Muted { until: i64 },
     /// Refused, and the player is banned until then.
     Banned { until: i64 },
+    /// Silenced: the text is shown to its sender only, and the player is muted in secret until then.
+    /// Nobody else sees their chat and they see no one else's; they are told nothing.
+    Silenced { until: i64 },
 }
 
 impl Action {
@@ -55,6 +58,7 @@ impl Action {
             Action::Refused => "refused",
             Action::Muted { .. } => "muted",
             Action::Banned { .. } => "banned",
+            Action::Silenced { .. } => "silenced",
         }
     }
 }
@@ -69,6 +73,8 @@ pub struct Mute {
     /// The operator who muted them (`/mute`, `/tempmute`); `None`: the filter.
     pub by: Option<String>,
     pub reason: Option<String>,
+    /// A silent mute: the player isn't told they are muted, and their chat and everyone else's stay hidden.
+    pub silent: bool,
 }
 
 impl Mute {
@@ -96,6 +102,10 @@ pub trait ChatGuard: Send + Sync {
     );
     /// A hit by the player at `now`: the hit's number, and what it leads to.
     fn strike(&mut self, uuid: u128, name: &str, now: i64) -> (u32, Action);
+    /// Screens a text the player is about to send, for links and adverts and for spam (the same
+    /// text again, or too many texts at once). A hit gives its kind, its number and what it leads to;
+    /// `None` lets the text through. Every text counts towards the spam limits, allowed or not.
+    fn screen(&mut self, uuid: u128, name: &str, text: &str, now: i64) -> Option<Screen>;
     /// Lifts a player's mute, by name; the name as muted, if they were.
     fn unmute(&mut self, name: &str) -> Option<String>;
     /// Writes a refused text to the filter's own log, when it keeps one; `Err` says why it couldn't.
@@ -110,6 +120,23 @@ pub trait ChatGuard: Send + Sync {
         action: Action,
         text: &str,
     ) -> Result<(), String>;
+}
+
+/// A text the filter stopped for a reason other than a word of its list.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Screen {
+    pub kind: ScreenKind,
+    pub count: u32,
+    pub action: Action,
+}
+
+/// Why a text was screened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScreenKind {
+    /// A link, a server address or a server advert.
+    Advert,
+    /// Too many texts in a moment, or the same text again and again.
+    Spam,
 }
 
 /// What [`load`] gives: the filter (`None`: off) and the lines to log, as (level, line).

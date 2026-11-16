@@ -42,8 +42,7 @@ use horizon_world::{
     compression::Compression,
     heightmap::{Heightmap, HeightmapChunk, HeightmapState, HeightmapType},
     nbt::{self, Compound, JavaString, Limits, NamedTag, Tag},
-    linear::{self, LinearRegion},
-    region::ChunkRecord,
+    region::{ChunkRecord, RegionFile},
     registry::{BlockRegistry, BlockStateId},
     worldgen::terrain::TerrainBlockStates,
 };

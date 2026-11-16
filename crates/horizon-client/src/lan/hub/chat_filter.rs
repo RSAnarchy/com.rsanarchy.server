@@ -8,7 +8,7 @@ use horizon_protocol::{
     text::literal,
 };
 pub use horizon_server_files::chat_guard::Place;
-use horizon_server_files::chat_guard::{Action, ChatGuard, Mute, duration_text};
+use horizon_server_files::chat_guard::{Action, ChatGuard, Mute, ScreenKind, duration_text};
 use horizon_world::nbt::{JavaString, Tag};
 
 /// What the sender reads when their text held a slur.
@@ -25,6 +25,14 @@ pub fn notice(place: Place, action: Action, now: i64) -> String {
             duration_text(until - now)
         ),
         _ => format!("{refused}: slurs aren't allowed here."),
+    }
+}
+
+/// What the sender reads when the advert or spam screen stops their text.
+pub fn screen_notice(kind: ScreenKind) -> &'static str {
+    match kind {
+        ScreenKind::Advert => "That message wasn't sent: links and server adverts aren't allowed here.",
+        ScreenKind::Spam => "That message wasn't sent: you're sending messages too fast or repeating yourself.",
     }
 }
 
@@ -72,6 +80,14 @@ impl Hub {
         self.chat_filter.is_some()
     }
 
+    /// Whether the player is under a silent mute now: their chat is shown to themselves only.
+    pub fn silenced(&self, uuid: u128) -> bool {
+        self.chat_filter
+            .as_deref()
+            .and_then(|g| g.muted(uuid, now_millis()))
+            .is_some_and(|m| m.silent)
+    }
+
     /// Whether guest `i` may send `texts` (`place` says where to): true without a filter. A refusal
     /// tells the sender, counts a hit when a text holds a slur, and pushes `ChatFiltered`.
     pub fn chat_allowed(
@@ -86,17 +102,52 @@ impl Hub {
         };
         let (uuid, now) = (self.guests[i].uuid, now_millis());
         let hit = texts.iter().any(|t| guard.matches(t));
-        let muted = place.is_chat().then(|| guard.muted(uuid, now)).flatten();
+        let is_chat = place.is_chat();
+        let muted = is_chat.then(|| guard.muted(uuid, now)).flatten();
+        // A silent mute (the advert and spam screen's): the text is shown to its sender only.
+        let silent = muted.is_some_and(|m| m.silent);
+        let muted_text = muted.filter(|m| !m.silent).map(|m| muted_notice(m, now));
         if !hit {
-            let Some(mute) = muted else {
-                return true;
-            };
-            let text = muted_notice(mute, now);
-            self.guests[i].send(&C::SystemChat(play::SystemChat {
-                content: red(&text),
-                overlay: false,
-            }));
-            return false;
+            let name = self.guests[i].name.clone();
+            let joined = texts.join(" | ");
+            if silent {
+                self.guests[i].send(&C::SystemChat(play::SystemChat {
+                    content: literal(&format!("<{name}> {joined}")),
+                    overlay: false,
+                }));
+                return false;
+            }
+            if let Some(text) = muted_text {
+                self.guests[i].send(&C::SystemChat(play::SystemChat {
+                    content: red(&text),
+                    overlay: false,
+                }));
+                return false;
+            }
+            // The advert and spam screen: only for chat, after the word list let the text through.
+            if is_chat && let Some(screen) = guard.screen(uuid, &name, &joined, now) {
+                match screen.action {
+                    // The sender sees their text as sent; nobody else does, and they are told nothing.
+                    Action::Silenced { .. } => self.guests[i].send(&C::SystemChat(play::SystemChat {
+                        content: literal(&format!("<{name}> {joined}")),
+                        overlay: false,
+                    })),
+                    _ => self.guests[i].send(&C::SystemChat(play::SystemChat {
+                        content: red(screen_notice(screen.kind)),
+                        overlay: false,
+                    })),
+                }
+                events.push(HostEvent::ChatFiltered {
+                    sender: uuid,
+                    name,
+                    place,
+                    text: joined,
+                    count: screen.count,
+                    action: screen.action,
+                });
+                return false;
+            }
+            return true;
         }
         // An anvil renames at every key typed: refused quietly, on the action bar, with no hit.
         if place == Place::Anvil {
@@ -190,6 +241,7 @@ mod tests {
             until,
             by: by.map(Into::into),
             reason: reason.map(Into::into),
+            silent: false,
         };
         assert_eq!(
             muted_notice(&mute(Some(now + 61_000), None, None), now),

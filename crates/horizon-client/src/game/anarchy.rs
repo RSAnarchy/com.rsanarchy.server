@@ -35,7 +35,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     net::IpAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -1882,20 +1882,19 @@ impl Game<'_> {
         )]
     }
 
-    /// `/worldstats`: the players the server has spawned at least once (the
-    /// user cache, everyone who has ever joined), how old the map is (the
-    /// world folder's creation) and what the world weighs on disk.
+    /// `/worldstats`: the players the server has spawned at least once (one player data
+    /// file each, so names only looked up don't count), how old the map is (the world
+    /// folder's creation) and what the world weighs on disk.
     fn anarchy_worldstats(&self) -> Vec<Reply> {
-        let players = dedicated::cached_user_count();
         let gold = |n: String| Text::literal(n).with_color(text::GOLD);
-        let mut out = vec![Reply::translated(
-            "horizon.worldstats.players",
-            &[gold(players.to_string())],
-        )];
         let dir = PathBuf::from("server.toml")
             .parent()
             .map_or_else(PathBuf::new, PathBuf::from);
         let dir = dir.join(world_name());
+        let mut out = vec![Reply::translated(
+            "horizon.worldstats.players",
+            &[gold(players_joined(&dir).to_string())],
+        )];
         let (years, months, days) = map_age(&dir);
         out.push(Reply::translated(
             "horizon.worldstats.map_age",
@@ -1912,6 +1911,17 @@ impl Game<'_> {
         ));
         out
     }
+}
+
+/// The players who have joined a world: one player data file each (`players/data/<uuid>.dat`,
+/// the same file that says a player has played before). A name only looked up leaves none.
+fn players_joined(world: &Path) -> usize {
+    std::fs::read_dir(world.join("players").join("data")).map_or(0, |entries| {
+        entries
+            .flatten()
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "dat"))
+            .count()
+    })
 }
 
 /// A password's length rule.

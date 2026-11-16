@@ -44,6 +44,7 @@ mod acknowledgements;
 /// GameEvent types (ClientboundGameEventPacket).
 pub mod chat;
 pub mod chat_filter;
+mod bot_watch;
 mod chunk_batch;
 mod spawn_info;
 
@@ -353,6 +354,8 @@ pub struct Hub {
     pub anticheat: Option<Box<super::anticheat::Anticheat>>,
     /// The chat filter, when `server.toml` turns it on (dedicated servers).
     pub chat_filter: Option<Box<dyn horizon_server_files::chat_guard::ChatGuard>>,
+    /// Each player's bot-detection watch (hub/bot_watch.rs).
+    pub bot_watch: std::collections::HashMap<u128, bot_watch::Watch>,
     /// The far ring, when `server.toml`'s `max_view_distance` turns it on (dedicated servers).
     pub far: Option<super::far::Far>,
     /// The `immediate_respawn` game rule, as the players were last told.
@@ -746,6 +749,7 @@ impl Hub {
             movement_checks: (true, true),
             anticheat: None,
             chat_filter: None,
+            bot_watch: std::collections::HashMap::new(),
             far: None,
             singleplayer_owner: None,
             flat_world: false,
@@ -4294,6 +4298,9 @@ impl Hub {
         {
             self.kick(conn, invalid_movement());
             return;
+        }
+        if let Some(p) = pos {
+            self.bot_moved(i, p);
         }
         if self.anticheat.is_some() {
             self.anticheat_moved(i, pos, rot, flags);
