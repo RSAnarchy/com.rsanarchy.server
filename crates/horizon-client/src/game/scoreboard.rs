@@ -110,6 +110,9 @@ impl Game<'_> {
     /// The border `dim`'s level saved. The Overworld also reads the root file older Horizon
     /// builds wrote for their one shared border; the other levels start from the default.
     pub(super) fn load_border(&self, dim: super::Dim) -> horizon_client::worldborder::WorldBorder {
+        if self.anarchy_border_off() {
+            return horizon_client::worldborder::WorldBorder::default();
+        }
         let mut root = save::read_dat(&self.border_path(dim));
         if root.is_none() && dim == super::Dim::Overworld {
             root = save::read_dat(&self.world_root.join("data/minecraft/world_border.dat"));

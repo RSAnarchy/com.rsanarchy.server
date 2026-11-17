@@ -44,8 +44,9 @@ These are optional and configured in the `[anarchy]` section of `server.toml`:
 - Cracked login with `/register`, `/login`, and `/changepassword`, with rate limits.
 - `/whisper`, `/ignore`, `/ignorelist`, `/discord`, `/addsocial`, `/skin set`, and `/worldstats`.
 - Homes with `/sethome`, `/home`, `/delhome`, and `/homes`, up to 5 per player.
-- `/rtp` (also `/randomtp`) and `/playerstats [name]`.
+- `/rtp` (also `/randomtp`) and `/playerstats [name]`. A random spot is picked ahead of time, so `/rtp` and respawns move the player once, to a spot whose ground is loaded.
 - A custom tab list header and footer.
+- `world_border = false` turns the world border off. The saved border is ignored and `/worldborder` changes are undone each tick.
 - A dupe chain event, a Christmas event that is off unless set in `[anarchy]`.
 
 Run `/help` in game for the full list.

@@ -200,6 +200,9 @@ pub(super) struct AnarchyConfig {
     pub dupe_sign: String,
     pub dupe_radius: f64,
     pub dupe_ends_unix: u64,
+    /// false: no world border. The saved border is ignored (the default one is used), and a
+    /// `/worldborder` change is undone each tick. Needs `enabled = true`.
+    pub world_border: bool,
 }
 impl Default for AnarchyConfig {
     fn default() -> Self {
@@ -213,6 +216,7 @@ impl Default for AnarchyConfig {
             dupe_sign: "dupe".to_owned(),
             dupe_radius: 10.0,
             dupe_ends_unix: 0,
+            world_border: true,
         }
     }
 }
@@ -231,6 +235,10 @@ pub(super) struct Anarchy {
     held_saves: HashMap<u128, HeldSave>,
     /// Players waiting for a random spawn's chunk to load (the spot is searched each tick).
     pub(super) pending_spawn: Vec<u128>,
+    /// The random spawns ready to use: ground already loaded (`anarchy_fill_spawns`).
+    pub(super) spawn_pool: Vec<[f64; 3]>,
+    /// The column the search is waiting on while its chunk loads.
+    pub(super) spawn_candidate: Option<[i32; 2]>,
     /// Ticks of no damage left after a random landing (the reference's nodamagetime).
     pub(super) grace: HashMap<u128, u32>,
     /// Whether a hopper is a dupe hopper, for a few seconds (see `dupe_chain_at`).
@@ -351,6 +359,17 @@ pub(super) const RANDOM_SPAWN_LIFT: f64 = 3.0;
 /// No damage after a random landing: 5 seconds (the reference's nodamagetime).
 pub(super) const RANDOM_SPAWN_GRACE_TICKS: u32 = 100;
 
+/// Ready random spots kept for a respawn or `/rtp` to take at once.
+pub(super) const RANDOM_SPAWN_POOL: usize = 4;
+
+/// Column checks the pool fill makes per tick, so a fill never holds up the tick.
+pub(super) const RANDOM_SPAWN_FILL_STEPS: u32 = 8;
+
+/// The feet of a random landing on the ground at (x, y, z).
+pub(super) fn landing(x: i32, y: i32, z: i32) -> [f64; 3] {
+    [f64::from(x) + 0.5, f64::from(y) + 1.0 + RANDOM_SPAWN_LIFT, f64::from(z) + 0.5]
+}
+
 /// The random spawn's attempts before it gives up for this tick.
 pub(super) const RANDOM_SPAWN_ATTEMPTS: u32 = 64;
 
@@ -371,7 +390,7 @@ pub(super) enum Column {
 pub(super) enum Pick {
     /// Feet to stand at.
     Found([f64; 3]),
-    /// The chunk at this column must load before the search can finish.
+    /// The column at this (x, z) must load before the search can finish.
     Waiting([i32; 2]),
     /// No ground in `RANDOM_SPAWN_ATTEMPTS` tries (the caller falls back).
     Exhausted,
@@ -402,7 +421,7 @@ pub(super) fn pick_random_spawn(
                     f64::from(z) + 0.5,
                 ]);
             }
-            Column::Loading => return Pick::Waiting([x >> 4, z >> 4]),
+            Column::Loading => return Pick::Waiting([x, z]),
             Column::Unsafe => {}
         }
     }
@@ -457,6 +476,8 @@ impl Game<'_> {
                 held_modes: HashMap::new(),
                 held_saves: HashMap::new(),
                 pending_spawn: Vec::new(),
+                spawn_pool: Vec::new(),
+                spawn_candidate: None,
                 grace: HashMap::new(),
                 dupe_cache: HashMap::new(),
                 sessions: HashMap::new(),
@@ -472,44 +493,87 @@ impl Game<'_> {
         }
     }
 
-    /// A random spawn's feet from the loaded world (random-spawn's chooseSpawn):
-    /// safe ground, three blocks up. A column whose chunk is not loaded asks
-    /// the streaming for it (`streaming.center`) and gives None this time, so
-    /// a later try finds it.
+    /// A random spawn's feet, from the spawn pool. The pool is filled a few spots at a time each
+    /// tick (`anarchy_fill_spawns`), so a respawn or `/rtp` takes a spot whose ground is already
+    /// loaded and the player moves once. None while the pool is empty.
     pub(super) fn anarchy_random_feet(&mut self) -> Option<[f64; 3]> {
-        let picked = {
-            let world = &self.world;
-            let streaming = &self.streaming;
-            let facts = self.res.facts();
-            let air = world.air;
-            pick_random_spawn(&mut os_unit, |x, z| {
-                if !streaming.is_lit(x >> 4, z >> 4) {
-                    return Column::Loading;
-                }
-                for y in (world.bottom_y()..world.top_y()).rev() {
-                    let state = world.block(x, y, z);
-                    if state == air {
-                        continue;
-                    }
-                    // Water or lava, fire, leaves or cactus on top is not ground to stand on.
-                    let block = facts.get(state);
-                    if !matches!(block.fluid, horizon_client::blocks::Fluid::None)
-                        || unsafe_ground(&block.name)
-                    {
-                        return Column::Unsafe;
-                    }
-                    return Column::Ground(y);
-                }
-                Column::Unsafe
-            })
-        };
-        match picked {
-            Pick::Found(feet) => Some(feet),
-            Pick::Waiting([cx, cz]) => {
-                self.streaming.center = (cx, cz);
-                None
+        self.anarchy_fill_spawns();
+        self.anarchy
+            .as_mut()
+            .and_then(|a| (!a.spawn_pool.is_empty()).then(|| a.spawn_pool.remove(0)))
+    }
+
+    /// Fills the spawn pool with spots whose ground is loaded. A column that is still loading is
+    /// kept as the candidate, and its chunk is requested through `spawn_wait` (the extra chunks
+    /// the streaming loads); the search does not pick another until it resolves. The streaming
+    /// centre is never moved, so the players around the server keep their chunks.
+    pub(super) fn anarchy_fill_spawns(&mut self) {
+        if self.anarchy.is_none() {
+            return;
+        }
+        for _ in 0..RANDOM_SPAWN_FILL_STEPS {
+            let have = self.anarchy.as_ref().map_or(0, |a| a.spawn_pool.len());
+            if have >= RANDOM_SPAWN_POOL {
+                return;
             }
-            Pick::Exhausted => None,
+            let kept = self.anarchy.as_ref().and_then(|a| a.spawn_candidate);
+            let picked = {
+                let world = &self.world;
+                let streaming = &self.streaming;
+                let facts = self.res.facts();
+                let air = world.air;
+                let column = |x: i32, z: i32| {
+                    if !streaming.is_lit(x >> 4, z >> 4) {
+                        return Column::Loading;
+                    }
+                    for y in (world.bottom_y()..world.top_y()).rev() {
+                        let state = world.block(x, y, z);
+                        if state == air {
+                            continue;
+                        }
+                        // Water or lava, fire, leaves or cactus on top is not ground to stand on.
+                        let block = facts.get(state);
+                        if !matches!(block.fluid, horizon_client::blocks::Fluid::None)
+                            || unsafe_ground(&block.name)
+                        {
+                            return Column::Unsafe;
+                        }
+                        return Column::Ground(y);
+                    }
+                    Column::Unsafe
+                };
+                match kept {
+                    Some([x, z]) => match column(x, z) {
+                        Column::Ground(y) => Pick::Found(landing(x, y, z)),
+                        Column::Loading => Pick::Waiting([x, z]),
+                        Column::Unsafe => pick_random_spawn(&mut os_unit, &column),
+                    },
+                    None => pick_random_spawn(&mut os_unit, &column),
+                }
+            };
+            match picked {
+                Pick::Found(feet) => {
+                    if let Some(a) = self.anarchy.as_mut() {
+                        a.spawn_candidate = None;
+                        a.spawn_pool.push(feet);
+                    }
+                }
+                Pick::Waiting([x, z]) => {
+                    if let Some(a) = self.anarchy.as_mut() {
+                        a.spawn_candidate = Some([x, z]);
+                    }
+                    let chunk = (x >> 4, z >> 4);
+                    if !self.spawn_wait.contains(&chunk) {
+                        self.spawn_wait.push(chunk);
+                    }
+                    return;
+                }
+                Pick::Exhausted => {
+                    if let Some(a) = self.anarchy.as_mut() {
+                        a.spawn_candidate = None;
+                    }
+                }
+            }
         }
     }
 
@@ -559,7 +623,7 @@ impl Game<'_> {
                 self.run_level_teleports(host);
                 vec![Reply::literal("Teleported to a random spot")]
             }
-            None => vec![Reply::literal("Finding a spot: try /rtp again in a moment")],
+            None => vec![Reply::literal("Finding a spot: try /rtp again in a few seconds")],
         }
     }
 
@@ -667,6 +731,16 @@ impl Game<'_> {
     /// Whether `uuid` is inside the grace window (takes no damage).
     pub(super) fn anarchy_graced(&self, uuid: u128) -> bool {
         self.anarchy.as_ref().is_some_and(|a| a.grace.contains_key(&uuid))
+    }
+
+    /// Whether `uuid` is queued for a random landing and has no spot yet.
+    pub(super) fn anarchy_random_pending(&self, uuid: u128) -> bool {
+        self.anarchy.as_ref().is_some_and(|a| a.pending_spawn.contains(&uuid))
+    }
+
+    /// The world border is off: `[anarchy] world_border = false` while the extras are on.
+    pub(super) fn anarchy_border_off(&self) -> bool {
+        self.anarchy.as_ref().is_some_and(|a| !a.config.world_border)
     }
 
     /// Queues a player for a random spawn whose chunk is not loaded yet.
@@ -1251,6 +1325,7 @@ impl Game<'_> {
     /// The hold's per-second part (`tick_lan`): the reminders and the timeout
     /// kick, and the Tab list's header and footer (game/tablist.rs).
     pub(super) fn anarchy_tick(&mut self, host: &mut LanHost) {
+        self.anarchy_fill_spawns();
         if let Some(anarchy) = self.anarchy.as_mut() {
             anarchy.grace.retain(|_, ticks| {
                 *ticks = ticks.saturating_sub(1);

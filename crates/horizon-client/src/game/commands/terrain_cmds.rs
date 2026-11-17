@@ -357,6 +357,12 @@ impl Game<'_> {
         }
     }
     pub(in crate::game) fn tick_worldborder(&mut self) {
+        // `[anarchy] world_border = false`: whatever the border was set to, it is the default again.
+        if self.anarchy_border_off()
+            && self.border != horizon_client::worldborder::WorldBorder::default()
+        {
+            self.border = horizon_client::worldborder::WorldBorder::default();
+        }
         let remaining = self.border.remaining_ticks();
         self.border.tick();
         if remaining > 0

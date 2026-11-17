@@ -304,6 +304,9 @@ pub struct Anarchy {
     pub dupe_radius: f64,
     /// Unix seconds when the event ends (0: no end).
     pub dupe_ends_unix: u64,
+    /// false: no world border. The saved border is ignored, and a `/worldborder` change is undone
+    /// each tick. Needs `enabled = true`.
+    pub world_border: bool,
 }
 impl Default for Anarchy {
     fn default() -> Self {
@@ -317,6 +320,7 @@ impl Default for Anarchy {
             dupe_sign: "dupe".to_owned(),
             dupe_radius: 10.0,
             dupe_ends_unix: 0,
+            world_border: true,
         }
     }
 }
