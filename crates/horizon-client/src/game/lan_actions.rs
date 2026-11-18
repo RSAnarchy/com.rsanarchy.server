@@ -1344,6 +1344,11 @@ impl Game<'_> {
     /// Hand a container the guest opened over (ServerPlayer.openMenu);
     /// false when it is not one a guest can open.
     fn lan_open_container(&mut self, host: &mut LanHost, conn: u32, pos: (i32, i32, i32)) -> bool {
+        if let Some(guest) = host.hub.guest(conn)
+            && !self.anarchy_allow_interaction(guest.uuid, false)
+        {
+            return false;
+        }
         // A chest minecart, hopper minecart or chest boat keeps its slots
         // under a placeholder key (`ContainerEntity`): the menu is the
         // vehicle's own, not a block's.
@@ -2069,6 +2074,15 @@ impl Game<'_> {
         let Some(packet) = self.guest_plugin_channels(host, conn, gi, packet) else {
             return;
         };
+        let sequence = match &packet {
+            S::PlayerAction(action) if matches!(action.action, 0..=2) => Some(action.sequence),
+            S::UseItemOn(action) => Some(action.sequence),
+            S::UseItem(action) => Some(action.sequence),
+            _ => None,
+        };
+        if self.anarchy.is_some() && sequence.is_some_and(|sequence| sequence < 0) {
+            return;
+        }
         // A dead player acts no more, but the death screen still respawns and chats: its
         // commands run as anyone's (ServerGamePacketListenerImpl.handleChatCommand doesn't
         // look at the player's health).
@@ -2417,6 +2431,11 @@ impl Game<'_> {
                     .contains(f64::from(p.pos[0]), f64::from(p.pos[2]))
                 {
                     if spectator && self.spectator_use_portal(host, conn, gi, p.pos) {
+                        return;
+                    }
+                    if &*self.block_name(p.pos) == "minecraft:lever"
+                        && !self.anarchy_allow_interaction(host.hub.guests[gi].uuid, true)
+                    {
                         return;
                     }
                     let logged = self.world.block_log.as_ref().map_or(0, Vec::len);

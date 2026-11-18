@@ -16,6 +16,18 @@
 mod backpressure;
 mod block_entity_order;
 mod far_regions;
+
+use horizon_world::linear_v2;
+
+static DEDICATED_LINEAR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn use_dedicated_linear_storage() {
+    DEDICATED_LINEAR.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn dedicated_linear() -> bool {
+    DEDICATED_LINEAR.load(std::sync::atomic::Ordering::Relaxed)
+}
 mod respawn;
 mod writes;
 use writes::{Outstanding, Writer};
@@ -2120,9 +2132,39 @@ const MAX_OPEN_REGIONS: usize = 256;
 #[derive(Default)]
 struct RegionFiles {
     regions: HashMap<(i32, i32), (Option<Arc<Mutex<RegionFile>>>, u64)>,
+    linear_regions: HashMap<(i32, i32), (Arc<linear_v2::Region>, u64)>,
     clock: u64,
     /// Each region's write stamp (`far_regions::writing`).
     written: HashMap<(i32, i32), u64>,
+}
+
+fn cached_linear_region(
+    cache: &RegionCache,
+    key: (i32, i32),
+    path: &Path,
+) -> std::io::Result<Arc<linear_v2::Region>> {
+    const MAX_LINEAR_REGIONS: usize = 8;
+    let mut cache = cache
+        .lock()
+        .map_err(|_| std::io::Error::other("region cache poisoned"))?;
+    cache.clock += 1;
+    let now = cache.clock;
+    if let Some((region, used)) = cache.linear_regions.get_mut(&key) {
+        *used = now;
+        return Ok(region.clone());
+    }
+    let region = Arc::new(linear_v2::Region::open(path, ChunkPos::new(key.0, key.1))?);
+    if cache.linear_regions.len() >= MAX_LINEAR_REGIONS
+        && let Some(oldest) = cache
+            .linear_regions
+            .iter()
+            .min_by_key(|(_, (_, used))| *used)
+            .map(|(key, _)| *key)
+    {
+        cache.linear_regions.remove(&oldest);
+    }
+    cache.linear_regions.insert(key, (region.clone(), now));
+    Ok(region)
 }
 impl RegionFiles {
     #[cfg(test)]
@@ -2217,6 +2259,42 @@ fn write_region_records(
     }
     for ((rx, rz), list) in by_region {
         let path = region_path(root, folder, rx, rz);
+        if dedicated_linear() {
+            let _writing = far_regions::writing(cache, (rx, rz));
+            let position = ChunkPos::new(rx, rz);
+            let region = match linear_v2::Region::open(&path, position) {
+                Ok(region) => region,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if list.iter().all(|(_, record)| record.is_none()) {
+                        continue;
+                    }
+                    fs::create_dir_all(path.parent().expect("region has a parent"))?;
+                    linear_v2::Region::new(rx, rz)
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let changes = list
+                .into_iter()
+                .map(|(pos, record)| {
+                    let slot = (pos.x.rem_euclid(32) + 32 * pos.z.rem_euclid(32)) as usize;
+                    (
+                        slot,
+                        record.map(|record| linear_v2::Chunk {
+                            timestamp: u64::from(record.timestamp),
+                            nbt: record.compressed,
+                        }),
+                    )
+                })
+                .collect();
+            let saved = region.update(&path, changes);
+            cache
+                .lock()
+                .map_err(|_| "region cache poisoned")?
+                .linear_regions
+                .remove(&(rx, rz));
+            saved?;
+            continue;
+        }
         // Clearing chunks of a region that doesn't exist changes nothing.
         let create = list.iter().any(|(_, r)| r.is_some());
         let Some(region) = cached_region(cache, (rx, rz), &path, create)? else {
@@ -2292,7 +2370,8 @@ fn share_out<R: Send>(
 }
 
 fn region_path(root: &Path, folder: &str, rx: i32, rz: i32) -> PathBuf {
-    root.join(format!("{folder}/r.{rx}.{rz}.mca"))
+    let extension = if dedicated_linear() { "linear" } else { "mca" };
+    root.join(format!("{folder}/r.{rx}.{rz}.{extension}"))
 }
 
 /// A record waiting for the writer thread.
@@ -2384,6 +2463,25 @@ fn read_region_record(
 ) -> Result<Option<NamedTag>> {
     let key = (x >> 5, z >> 5);
     let path = region_path(root, folder, key.0, key.1);
+    if dedicated_linear() {
+        let region = match cached_linear_region(cache, key, &path) {
+            Ok(region) => region,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        return region
+            .read(ChunkPos::new(x, z))?
+            .map(|chunk| {
+                ChunkRecord {
+                    compression: Compression::None,
+                    compressed: chunk.nbt,
+                    timestamp: 0,
+                }
+                .nbt(Limits::saved())
+                .map_err(Into::into)
+            })
+            .transpose();
+    }
     let Some(region) = cached_region(cache, key, &path, false)? else {
         return Ok(None);
     };
@@ -2725,6 +2823,33 @@ impl SaveDir {
     /// before DataVersion 4997, or with `blending_data`.
     pub fn old_chunk_bits(&self, rx: i32, rz: i32) -> [u64; 16] {
         let mut bits = [0u64; 16];
+        if dedicated_linear() {
+            let path = self.region_path("region", rx, rz);
+            let result = linear_v2::Region::open(&path, ChunkPos::new(rx, rz))
+                .and_then(|region| region.chunks());
+            match result {
+                Ok(chunks) => {
+                    for (index, chunk) in chunks.into_iter().enumerate() {
+                        let Some(chunk) = chunk else { continue };
+                        let record = ChunkRecord {
+                            compression: Compression::None,
+                            compressed: chunk.nbt,
+                            timestamp: 0,
+                        };
+                        match record.nbt(Limits::saved()) {
+                            Ok(root) if record_is_old(&root) => {
+                                bits[index / 64] |= 1 << (index % 64);
+                            }
+                            Err(error) => eprintln!("{}: {error}", path.display()),
+                            _ => {}
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => eprintln!("{}: {error}", path.display()),
+            }
+            return bits;
+        }
         let Ok(region) = RegionFile::open(self.region_path("region", rx, rz)) else {
             return bits;
         };

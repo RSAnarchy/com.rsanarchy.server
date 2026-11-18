@@ -61,7 +61,9 @@ Three checks run on chat, configured in the `[chat_filter]` section of `server.t
 
 ## Storage
 
-The server reads and writes Anvil (`.mca`) region files. Linear region support (`.linear`) is WIP and not used by the server. `horizon-world`'s `merge-linear` command can put linear chunks back into `.mca` files.
+The dedicated server uses Linear v2 (`.linear`) for terrain, entities, and POI. It rejects worlds with legacy region files during startup.
+
+Run `horizon-world convert-linear-v2 <world-folder> --dry-run` to verify conversion, or substitute a new staging directory for `--dry-run` to write and verify region files. Staging contains only converted regions. Keep the original world as a backup and preserve the rest of the world, including player data and `level.dat`, when installing the staged regions with the server stopped.
 
 ## License
 

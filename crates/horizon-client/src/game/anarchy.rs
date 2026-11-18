@@ -23,13 +23,16 @@
 //! goes into `passwords.db`, a SQLite database beside server.properties, and every reply says
 //! no more than the commands do. All lines are translation keys with the
 //! game's English as their fallback (`game/chat_filter.rs`'s `Reply`).
-use super::{chat_filter::Reply, dedicated, lan::LanHost, server_travel::LevelTeleport, Dim, Game};
+use super::{Dim, Game, chat_filter::Reply, dedicated, lan::LanHost, server_travel::LevelTeleport};
 use horizon_client::{
-    containers::BlockEntity, lan::data::component_nbt, mod_api::NativeCommand, text::{self, Text},
+    containers::BlockEntity,
+    lan::data::component_nbt,
+    mod_api::NativeCommand,
+    text::{self, Text},
 };
 use horizon_protocol::packets::play::{self, Clientbound as C};
 use horizon_server_files::user_lists::NameAndId;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -150,13 +153,21 @@ impl LoginGuard {
         }
         let account = self.accounts.entry(uuid).or_default();
         *account.failures.entry(ip).or_insert(0) += 1;
-        let guessers = account.failures.values().filter(|n| **n >= IP_ATTEMPTS).count();
+        let guessers = account
+            .failures
+            .values()
+            .filter(|n| **n >= IP_ATTEMPTS)
+            .count();
         if guessers >= ACCOUNT_GUESSERS {
             account.locked_until = Some(now + ACCOUNT_LOCK);
             account.failures.clear();
             return Brake::Account;
         }
-        if address_blocked { Brake::Address } else { Brake::None }
+        if address_blocked {
+            Brake::Address
+        } else {
+            Brake::None
+        }
     }
 
     /// A right password from `ip` for `uuid`: its wrong passwords are forgiven.
@@ -203,6 +214,22 @@ pub(super) struct AnarchyConfig {
     /// false: no world border. The saved border is ignored (the default one is used), and a
     /// `/worldborder` change is undone each tick. Needs `enabled = true`.
     pub world_border: bool,
+    pub falling_blocks_per_chunk: Option<usize>,
+    pub experience_bottles_per_chunk: Option<usize>,
+    pub dropped_items_per_chunk: usize,
+    pub minecarts_per_chunk: usize,
+    pub vehicles_per_chunk: usize,
+    pub projectile_max_age_ticks: u32,
+    pub projectile_age_limits: std::collections::BTreeMap<String, u32>,
+    pub villagers_per_chunk: usize,
+    pub block_entities_per_chunk: usize,
+    pub lever_uses_per_two_seconds: u32,
+    pub inventory_opens_per_second: u32,
+    pub villager_removal_priority: Vec<String>,
+    pub mob_limits_per_chunk: std::collections::BTreeMap<String, usize>,
+    pub prevent_command_sign: bool,
+    pub sign_line_character_limit: usize,
+    pub sign_total_character_limit: usize,
 }
 impl Default for AnarchyConfig {
     fn default() -> Self {
@@ -217,6 +244,44 @@ impl Default for AnarchyConfig {
             dupe_radius: 10.0,
             dupe_ends_unix: 0,
             world_border: true,
+            // High-playercount anarchy defaults: prevent common lag machines without
+            // being overly restrictive. Tune per-server in server.toml [anarchy].
+            falling_blocks_per_chunk: Some(60),
+            experience_bottles_per_chunk: Some(25),
+            dropped_items_per_chunk: 300,
+            minecarts_per_chunk: 40,
+            vehicles_per_chunk: 60,
+            // Global projectile cleanup (ender pearls/wither skulls are exempted at runtime).
+            projectile_max_age_ticks: 300,
+            projectile_age_limits: Default::default(),
+            villagers_per_chunk: 0,
+            block_entities_per_chunk: 1000,
+            lever_uses_per_two_seconds: 30,
+            inventory_opens_per_second: 20,
+            villager_removal_priority: [
+                "none",
+                "nitwit",
+                "shepherd",
+                "fisherman",
+                "butcher",
+                "cartographer",
+                "leatherworker",
+                "fletcher",
+                "mason",
+                "farmer",
+                "armorer",
+                "toolsmith",
+                "weaponsmith",
+                "cleric",
+                "librarian",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            mob_limits_per_chunk: Default::default(),
+            prevent_command_sign: true,
+            sign_line_character_limit: 80,
+            sign_total_character_limit: 384,
         }
     }
 }
@@ -225,6 +290,7 @@ impl Default for AnarchyConfig {
 /// attempts and the skin lookups' cooldowns, and the game mode a held player
 /// had (back to them on authentication).
 pub(super) struct Anarchy {
+    interaction_limits: HashMap<(u128, bool), (Instant, u32)>,
     pub config: AnarchyConfig,
     pub store: Store,
     login: LoginGuard,
@@ -350,7 +416,7 @@ fn restored_mode(saved: i32) -> i32 {
 
 /// The random spawn (from random-spawn, by josvth): a new player, or one with
 /// no bed, lands at a random point within `RANDOM_SPAWN_RADIUS` of 0,0.
-pub(super) const RANDOM_SPAWN_RADIUS: f64 = 1000.0;
+pub(super) const RANDOM_SPAWN_RADIUS: f64 = 50000.0;
 
 /// How far above the found ground a random spawn lands the player (the
 /// reference's `location.add(0, 3, 0)`), so they do not land inside a block.
@@ -367,7 +433,11 @@ pub(super) const RANDOM_SPAWN_FILL_STEPS: u32 = 8;
 
 /// The feet of a random landing on the ground at (x, y, z).
 pub(super) fn landing(x: i32, y: i32, z: i32) -> [f64; 3] {
-    [f64::from(x) + 0.5, f64::from(y) + 1.0 + RANDOM_SPAWN_LIFT, f64::from(z) + 0.5]
+    [
+        f64::from(x) + 0.5,
+        f64::from(y) + 1.0 + RANDOM_SPAWN_LIFT,
+        f64::from(z) + 0.5,
+    ]
 }
 
 /// The random spawn's attempts before it gives up for this tick.
@@ -402,7 +472,10 @@ pub(super) enum Pick {
 pub(super) fn disc_point(radius: f64, unit: &mut impl FnMut() -> f64) -> [i32; 2] {
     let r = unit().sqrt() * radius;
     let phi = unit() * std::f64::consts::TAU;
-    [(r * phi.cos()).floor() as i32, (r * phi.sin()).floor() as i32]
+    [
+        (r * phi.cos()).floor() as i32,
+        (r * phi.sin()).floor() as i32,
+    ]
 }
 
 /// The reference's chooseSpawn loop: random columns until one has ground
@@ -431,8 +504,10 @@ pub(super) fn pick_random_spawn(
 /// Blocks a player cannot stand on at a random spawn (the reference's blacklist:
 /// fire, leaves, cactus). Water and lava are caught by their fluid.
 pub(super) fn unsafe_ground(name: &str) -> bool {
-    matches!(name, "minecraft:fire" | "minecraft:soul_fire" | "minecraft:cactus")
-        || name.ends_with("_leaves")
+    matches!(
+        name,
+        "minecraft:fire" | "minecraft:soul_fire" | "minecraft:cactus"
+    ) || name.ends_with("_leaves")
 }
 
 /// A number in [0, 1) from the OS random source.
@@ -469,6 +544,7 @@ impl Game<'_> {
             .filter(|file| file.anarchy.enabled);
         self.anarchy = file.and_then(|file| match Store::open() {
             Ok(store) => Some(Anarchy {
+                interaction_limits: HashMap::new(),
                 config: file.anarchy,
                 store,
                 login: LoginGuard::default(),
@@ -484,7 +560,10 @@ impl Game<'_> {
                 rtp_last: HashMap::new(),
             }),
             Err(e) => {
-                dedicated::log("ERROR", &format!("Anarchy off: the password database did not open: {e}"));
+                dedicated::log(
+                    "ERROR",
+                    &format!("Anarchy off: the password database did not open: {e}"),
+                );
                 None
             }
         });
@@ -591,7 +670,9 @@ impl Game<'_> {
     pub(super) fn anarchy_session_end(&mut self, uuid: u128) {
         if let Some(anarchy) = self.anarchy.as_mut()
             && let Some(start) = anarchy.sessions.remove(&uuid)
-            && let Err(e) = anarchy.store.add_playtime(uuid, start.elapsed().as_secs() as i64)
+            && let Err(e) = anarchy
+                .store
+                .add_playtime(uuid, start.elapsed().as_secs() as i64)
         {
             dedicated::log("ERROR", &format!("playtime not saved: {e}"));
         }
@@ -601,7 +682,10 @@ impl Game<'_> {
     /// 30-second cooldown: each search loads chunks.
     pub(super) fn anarchy_rtp(&mut self, host: &mut LanHost, conn: u32, uuid: u128) -> Vec<Reply> {
         const COOLDOWN: Duration = Duration::from_secs(30);
-        if let Some(last) = self.anarchy.as_ref().and_then(|a| a.rtp_last.get(&uuid).copied())
+        if let Some(last) = self
+            .anarchy
+            .as_ref()
+            .and_then(|a| a.rtp_last.get(&uuid).copied())
             && last.elapsed() < COOLDOWN
         {
             return vec![Reply::literal("Wait a moment before the next /rtp")];
@@ -623,18 +707,30 @@ impl Game<'_> {
                 self.run_level_teleports(host);
                 vec![Reply::literal("Teleported to a random spot")]
             }
-            None => vec![Reply::literal("Finding a spot: try /rtp again in a few seconds")],
+            None => vec![Reply::literal(
+                "Finding a spot: try /rtp again in a few seconds",
+            )],
         }
     }
 
     /// `/playerstats [name]`: the join date, playtime and homes of the player or of
     /// another who has joined this server.
-    pub(super) fn anarchy_playerstats(&self, host: &LanHost, uuid: u128, name: &str, args: &[&str]) -> Vec<Reply> {
+    pub(super) fn anarchy_playerstats(
+        &self,
+        host: &LanHost,
+        uuid: u128,
+        name: &str,
+        args: &[&str],
+    ) -> Vec<Reply> {
         let (who, id) = match args.first() {
             None => (name.to_owned(), uuid),
             Some(target) => match self.resolve_name(target) {
                 Some(found) => (found.name, found.id),
-                None => return vec![Reply::literal(format!("No player named {target} has joined"))],
+                None => {
+                    return vec![Reply::literal(format!(
+                        "No player named {target} has joined"
+                    ))];
+                }
             },
         };
         let Some(anarchy) = self.anarchy.as_ref() else {
@@ -662,9 +758,13 @@ impl Game<'_> {
                 .with_color(horizon_client::text::GRAY),
             Reply::literal(format!("Playtime: {}", duration_text(playtime)))
                 .with_color(horizon_client::text::GRAY),
-            Reply::literal(format!("Homes: {homes}/{HOME_LIMIT}")).with_color(horizon_client::text::GRAY),
-            Reply::literal(format!("Status: {}", if online { "online" } else { "offline" }))
+            Reply::literal(format!("Homes: {homes}/{HOME_LIMIT}"))
                 .with_color(horizon_client::text::GRAY),
+            Reply::literal(format!(
+                "Status: {}",
+                if online { "online" } else { "offline" }
+            ))
+            .with_color(horizon_client::text::GRAY),
         ]
     }
 
@@ -718,7 +818,9 @@ impl Game<'_> {
 
     /// A held player's pre-hold state, if they are held.
     pub(super) fn anarchy_held_save(&self, uuid: u128) -> Option<HeldSave> {
-        self.anarchy.as_ref().and_then(|a| a.held_saves.get(&uuid).cloned())
+        self.anarchy
+            .as_ref()
+            .and_then(|a| a.held_saves.get(&uuid).cloned())
     }
 
     /// A random landing: no damage for the grace window.
@@ -730,17 +832,23 @@ impl Game<'_> {
 
     /// Whether `uuid` is inside the grace window (takes no damage).
     pub(super) fn anarchy_graced(&self, uuid: u128) -> bool {
-        self.anarchy.as_ref().is_some_and(|a| a.grace.contains_key(&uuid))
+        self.anarchy
+            .as_ref()
+            .is_some_and(|a| a.grace.contains_key(&uuid))
     }
 
     /// Whether `uuid` is queued for a random landing and has no spot yet.
     pub(super) fn anarchy_random_pending(&self, uuid: u128) -> bool {
-        self.anarchy.as_ref().is_some_and(|a| a.pending_spawn.contains(&uuid))
+        self.anarchy
+            .as_ref()
+            .is_some_and(|a| a.pending_spawn.contains(&uuid))
     }
 
     /// The world border is off: `[anarchy] world_border = false` while the extras are on.
     pub(super) fn anarchy_border_off(&self) -> bool {
-        self.anarchy.as_ref().is_some_and(|a| !a.config.world_border)
+        self.anarchy
+            .as_ref()
+            .is_some_and(|a| !a.config.world_border)
     }
 
     /// Queues a player for a random spawn whose chunk is not loaded yet.
@@ -781,8 +889,10 @@ impl Store {
     fn init(conn: Connection) -> Result<Self, String> {
         let err = |e: rusqlite::Error| e.to_string();
         conn.busy_timeout(Duration::from_secs(5)).map_err(err)?;
-        conn.pragma_update(None, "journal_mode", "WAL").map_err(err)?;
-        conn.pragma_update(None, "synchronous", "NORMAL").map_err(err)?;
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(err)?;
+        conn.pragma_update(None, "synchronous", "NORMAL")
+            .map_err(err)?;
         conn.execute_batch(SCHEMA).map_err(err)?;
         let store = Self { conn };
         store.migrate_home_names()?;
@@ -901,7 +1011,11 @@ impl Store {
     fn has_account(&self, uuid: u128) -> bool {
         matches!(
             self.conn
-                .query_row("SELECT 1 FROM accounts WHERE uuid = ?1", params![key(uuid)], |_| Ok(()))
+                .query_row(
+                    "SELECT 1 FROM accounts WHERE uuid = ?1",
+                    params![key(uuid)],
+                    |_| Ok(())
+                )
                 .optional(),
             Ok(Some(()))
         )
@@ -948,7 +1062,11 @@ impl Store {
             .conn
             .execute(
                 "UPDATE accounts SET salt = ?2, hash = ?3 WHERE uuid = ?1",
-                params![key(uuid), salt.to_vec(), hash_password(&salt, password).to_vec()],
+                params![
+                    key(uuid),
+                    salt.to_vec(),
+                    hash_password(&salt, password).to_vec()
+                ],
             )
             .map_err(|e| e.to_string())?;
         Ok(changed == 1)
@@ -1107,7 +1225,11 @@ impl Store {
                 ],
             )
             .map_err(err)?;
-        Ok(if exists { HomeSet::Updated } else { HomeSet::Created })
+        Ok(if exists {
+            HomeSet::Updated
+        } else {
+            HomeSet::Created
+        })
     }
 
     /// Deletes one of a player's homes; whether it existed.
@@ -1201,12 +1323,23 @@ fn utc_parts(unix: i64) -> (i64, u32, u32, u32, u32) {
     let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
     let month = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
     let year = yoe + era * 400 + (month <= 2) as i64;
-    (year, month, day, (secs / 3600) as u32, ((secs % 3600) / 60) as u32)
+    (
+        year,
+        month,
+        day,
+        (secs / 3600) as u32,
+        ((secs % 3600) / 60) as u32,
+    )
 }
 
 /// `3d 4h 5m` for a number of seconds.
 fn duration_text(secs: i64) -> String {
-    format!("{}d {}h {}m", secs / 86_400, (secs % 86_400) / 3600, (secs % 3600) / 60)
+    format!(
+        "{}d {}h {}m",
+        secs / 86_400,
+        (secs % 86_400) / 3600,
+        (secs % 3600) / 60
+    )
 }
 
 /// Homes per player.
@@ -1215,17 +1348,28 @@ pub(super) const HOME_LIMIT: usize = 5;
 /// A home name: 1 to 16 letters, digits, `_` or `-`.
 pub(super) fn home_name_ok(name: &str) -> bool {
     (1..=16).contains(&name.len())
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// The login bar: a purple boss bar at the top of a held player's screen with the
 /// command to use, `/LOGIN` for an account, `/REGISTER` for a first time.
 fn login_bar(uuid: u128, account: bool) -> C {
-    let command = if account { "USE /LOGIN" } else { "USE /REGISTER" };
+    let command = if account {
+        "USE /LOGIN"
+    } else {
+        "USE /REGISTER"
+    };
     C::BossEvent(play::BossEvent {
         id: uuid,
         action: play::BossAction::Add {
-            name: component_nbt(&Text::literal(command).with_color(text::GOLD).bold().component()),
+            name: component_nbt(
+                &Text::literal(command)
+                    .with_color(text::GOLD)
+                    .bold()
+                    .component(),
+            ),
             progress: 1.0,
             // BossBarColor.PURPLE, BossBarOverlay.PROGRESS.
             color: 5,
@@ -1311,7 +1455,10 @@ impl Game<'_> {
         host.hub.login_hold.insert(uuid);
         host.hub.hidden.insert(uuid, 4);
         self.anarchy_load_ignores(host, uuid);
-        let account = self.anarchy.as_ref().is_some_and(|a| a.store.has_account(uuid));
+        let account = self
+            .anarchy
+            .as_ref()
+            .is_some_and(|a| a.store.has_account(uuid));
         if let Some(g) = host.hub.guest_mut(conn) {
             g.send(&C::SystemChat(play::SystemChat {
                 content: login_prompt(),
@@ -1324,7 +1471,256 @@ impl Game<'_> {
 
     /// The hold's per-second part (`tick_lan`): the reminders and the timeout
     /// kick, and the Tab list's header and footer (game/tablist.rs).
+    fn anarchy_limit_transient_entities(&mut self, host: &LanHost) {
+        let Some(anarchy) = &self.anarchy else { return };
+        let tick = self.world.game_time;
+        let block_entity_limit = anarchy.config.block_entities_per_chunk;
+        self.anarchy_limit_block_entities(tick, block_entity_limit);
+        self.anarchy_limit_non_block_entities(host, tick);
+    }
+
+    fn anarchy_limit_block_entities(&mut self, tick: i64, block_entity_limit: usize) {
+        if block_entity_limit > 0 && tick % 20 == 0 {
+            let mut by_chunk = std::collections::HashMap::<_, Vec<_>>::new();
+            for (&(x, y, z), _) in self.world.block_entities.iter() {
+                if y >= self.world.shape.min_y && y < self.world.shape.max_y() {
+                    by_chunk
+                        .entry((x >> 4, z >> 4))
+                        .or_default()
+                        .push([x, y, z]);
+                }
+            }
+            let mut excess = Vec::new();
+            for positions in by_chunk
+                .values_mut()
+                .filter(|positions| positions.len() > block_entity_limit)
+            {
+                positions.sort_unstable();
+                excess.extend_from_slice(&positions[block_entity_limit..]);
+            }
+            for [x, y, z] in excess {
+                self.world.block_entities.remove(&(x, y, z));
+                if let Err(error) =
+                    self.level_set([x, y, z], horizon_world::registry::BlockStateId(0))
+                {
+                    log::warn!("Could not remove excess block entity at {x}, {y}, {z}: {error}");
+                }
+            }
+        }
+    }
+
+    fn anarchy_limit_non_block_entities(&mut self, host: &LanHost, tick: i64) {
+        let Some(anarchy) = &self.anarchy else { return };
+        let age_limits = &anarchy.config.projectile_age_limits;
+        if !age_limits.is_empty() && tick % 1200 == 0 {
+            self.creatures.projectiles.retain(|projectile| {
+                age_limits
+                    .get(projectile.entity_type())
+                    .is_none_or(|&limit| projectile.age <= limit)
+            });
+        }
+        let mob_limits = &anarchy.config.mob_limits_per_chunk;
+        let villager_limit = anarchy.config.villagers_per_chunk;
+        let check_villagers = villager_limit > 0 && tick % 600 == 0;
+        let check_types = !mob_limits.is_empty() && tick % 1200 == 0;
+        if check_villagers {
+            use horizon_client::mobs::render::PROFESSIONS;
+            let mut chunks = std::collections::HashMap::<_, Vec<_>>::new();
+            for mob in self
+                .mobs
+                .iter()
+                .filter(|mob| mob.kind.id == "minecraft:villager")
+            {
+                let key = (
+                    mob.position.x.floor() as i32 >> 4,
+                    mob.position.z.floor() as i32 >> 4,
+                );
+                let profession = PROFESSIONS
+                    .get(usize::from(mob.extra.variant2))
+                    .copied()
+                    .unwrap_or("none");
+                let rank = anarchy
+                    .config
+                    .villager_removal_priority
+                    .iter()
+                    .position(|entry| entry.eq_ignore_ascii_case(profession))
+                    .unwrap_or(usize::MAX);
+                chunks.entry(key).or_default().push((rank, mob.id));
+            }
+            let mut remove = std::collections::HashSet::new();
+            for group in chunks
+                .values_mut()
+                .filter(|group| group.len() > villager_limit)
+            {
+                group.sort_unstable();
+                remove.extend(
+                    group
+                        .iter()
+                        .take(group.len() - villager_limit)
+                        .map(|&(_, id)| id),
+                );
+            }
+            self.mobs.retain(|mob| !remove.contains(&mob.id));
+        }
+        if check_types {
+            let mut counts = std::collections::HashMap::new();
+            self.mobs.retain(|mob| {
+                let id = &mob.kind.id;
+                let Some(&limit) = mob_limits.get(id) else {
+                    return true;
+                };
+                let key = (
+                    id.clone(),
+                    mob.position.x.floor() as i32 >> 4,
+                    mob.position.z.floor() as i32 >> 4,
+                );
+                let count = counts.entry(key).or_insert(0);
+                *count += 1;
+                *count <= limit
+            });
+        }
+        let projectile_age = anarchy.config.projectile_max_age_ticks;
+        if projectile_age > 0 && tick % 400 == 0 {
+            use horizon_client::projectiles::ProjectileKind;
+            self.creatures.projectiles.retain(|projectile| {
+                projectile.age <= projectile_age
+                    || matches!(
+                        projectile.kind,
+                        ProjectileKind::EnderPearl | ProjectileKind::WitherSkull { .. }
+                    )
+            });
+        }
+        let dropped_limit = anarchy.config.dropped_items_per_chunk;
+        if tick % 1200 == 0 && dropped_limit > 0 && self.dropped.len() > dropped_limit {
+            let mut counts = std::collections::HashMap::new();
+            self.dropped.retain(|item| {
+                let key = (
+                    item.position.x.floor() as i32 >> 4,
+                    item.position.z.floor() as i32 >> 4,
+                );
+                let count = counts.entry(key).or_insert(0);
+                *count += 1;
+                *count <= dropped_limit
+            });
+        }
+        let minecart_limit = anarchy.config.minecarts_per_chunk;
+        let vehicle_limit = anarchy.config.vehicles_per_chunk;
+        if tick % 400 == 0
+            && vehicle_limit > 0
+            && self.boats.len() + self.carts.len() > vehicle_limit
+        {
+            let occupied: std::collections::HashSet<_> = host
+                .hub
+                .guests
+                .iter()
+                .filter_map(|guest| guest.vehicle)
+                .chain(self.riding)
+                .collect();
+            let mut counts = std::collections::HashMap::new();
+            let mut keep = |id, x: f64, z: f64| {
+                let key = (x.floor() as i32 >> 4, z.floor() as i32 >> 4);
+                let count = counts.entry(key).or_insert(0);
+                *count += 1;
+                *count <= vehicle_limit || occupied.contains(&id)
+            };
+            self.boats
+                .retain(|boat| keep(boat.id, boat.position.x, boat.position.z));
+            self.carts
+                .retain(|cart| keep(cart.id, cart.position.x, cart.position.z));
+        }
+        if tick % 400 == 0 && minecart_limit > 0 && self.carts.len() > minecart_limit {
+            let mut counts = std::collections::HashMap::new();
+            let occupied: std::collections::HashSet<_> = host
+                .hub
+                .guests
+                .iter()
+                .filter_map(|guest| guest.vehicle)
+                .chain(self.riding)
+                .collect();
+            self.carts.retain(|cart| {
+                let key = (
+                    cart.position.x.floor() as i32 >> 4,
+                    cart.position.z.floor() as i32 >> 4,
+                );
+                let count = counts.entry(key).or_insert(0);
+                *count += 1;
+                *count <= minecart_limit || occupied.contains(&cart.id)
+            });
+        }
+        if let Some(limit) = anarchy.config.falling_blocks_per_chunk
+            && tick % 20 == 0
+            && self.falling.len() > limit
+        {
+            let mut counts = std::collections::HashMap::new();
+            self.falling.retain(|entity| {
+                let key = (
+                    entity.position.x.floor() as i32 >> 4,
+                    entity.position.z.floor() as i32 >> 4,
+                );
+                let count = counts.entry(key).or_insert(0);
+                *count += 1;
+                *count <= limit
+            });
+        }
+        if let Some(limit) = anarchy.config.experience_bottles_per_chunk
+            && tick % 800 == 0
+            && self.creatures.projectiles.len() > limit
+        {
+            let mut counts = std::collections::HashMap::new();
+            self.creatures.projectiles.retain(|entity| {
+                if entity.kind != horizon_client::projectiles::ProjectileKind::ExperienceBottle {
+                    return true;
+                }
+                let key = (
+                    entity.position.x.floor() as i32 >> 4,
+                    entity.position.z.floor() as i32 >> 4,
+                );
+                let count = counts.entry(key).or_insert(0);
+                *count += 1;
+                *count <= limit
+            });
+        }
+    }
+
+    pub(super) fn anarchy_allow_interaction(&mut self, uuid: u128, lever: bool) -> bool {
+        let Some(anarchy) = self.anarchy.as_mut() else {
+            return true;
+        };
+        let (limit, window) = if lever {
+            (
+                anarchy.config.lever_uses_per_two_seconds,
+                Duration::from_secs(2),
+            )
+        } else {
+            (
+                anarchy.config.inventory_opens_per_second,
+                Duration::from_secs(1),
+            )
+        };
+        if limit == 0 {
+            return true;
+        }
+        let now = Instant::now();
+        let entry = anarchy
+            .interaction_limits
+            .entry((uuid, lever))
+            .or_insert((now, 0));
+        if now.duration_since(entry.0) >= window {
+            *entry = (now, 0);
+        }
+        entry.1 = entry.1.saturating_add(1);
+        entry.1 <= limit
+    }
+
     pub(super) fn anarchy_tick(&mut self, host: &mut LanHost) {
+        self.anarchy_limit_transient_entities(host);
+        if self.world.game_time % 40 == 0
+            && let Some(anarchy) = self.anarchy.as_mut()
+        {
+            anarchy
+                .interaction_limits
+                .retain(|_, (start, _)| start.elapsed() < Duration::from_secs(2));
+        }
         self.anarchy_fill_spawns();
         if let Some(anarchy) = self.anarchy.as_mut() {
             anarchy.grace.retain(|_, ticks| {
@@ -1368,8 +1764,8 @@ impl Game<'_> {
                 .max(5) as u64;
             for (conn, _) in &held {
                 let g = host.hub.guests.iter().find(|g| g.conn == *conn);
-                let overdue = g.is_some_and(|g| host.hub.ticks.saturating_sub(g.joined_tick)
-                    > timeout * 20);
+                let overdue =
+                    g.is_some_and(|g| host.hub.ticks.saturating_sub(g.joined_tick) > timeout * 20);
                 if overdue {
                     host.hub.kick(*conn, login_timeout_kick());
                 }
@@ -1409,11 +1805,15 @@ impl Game<'_> {
             .anarchy
             .as_mut()
             .map_or(0, |a| a.held_modes.remove(&uuid).unwrap_or(0));
-        host.hub.set_game_mode(conn, mode, &self.world, Some(self.collision));
+        host.hub
+            .set_game_mode(conn, mode, &self.world, Some(self.collision));
         // Back to where they stood before the hold (a new player's random spawn, a
         // returning player's saved spot); else TeleportTransition.createDefault's
         // world spawn column.
-        let save = self.anarchy.as_mut().and_then(|a| a.held_saves.remove(&uuid));
+        let save = self
+            .anarchy
+            .as_mut()
+            .and_then(|a| a.held_saves.remove(&uuid));
         let spot = save
             .filter(|h| h.dimension == host.hub.config.dimension)
             .map(|h| h.position);
@@ -1452,7 +1852,13 @@ impl Game<'_> {
     // ---- the commands ---------------------------------------------------
 
     /// `/sethome <name>`: a home where the player stands.
-    fn anarchy_sethome(&mut self, host: &mut LanHost, conn: u32, uuid: u128, args: &[&str]) -> Vec<Reply> {
+    fn anarchy_sethome(
+        &mut self,
+        host: &mut LanHost,
+        conn: u32,
+        uuid: u128,
+        args: &[&str],
+    ) -> Vec<Reply> {
         let Some(name) = args.first().copied().filter(|n| home_name_ok(n)) else {
             return vec![Reply::translated("horizon.anarchy.home.invalid", &[])];
         };
@@ -1469,9 +1875,18 @@ impl Game<'_> {
             return vec![];
         };
         match anarchy.store.set_home(uuid, &home, HOME_LIMIT) {
-            Ok(HomeSet::Created) => vec![Reply::translated("horizon.anarchy.home.set", &[Text::literal(name)])],
-            Ok(HomeSet::Updated) => vec![Reply::translated("horizon.anarchy.home.updated", &[Text::literal(name)])],
-            Ok(HomeSet::Full) => vec![Reply::translated("horizon.anarchy.home.full", &[Text::literal(HOME_LIMIT.to_string())])],
+            Ok(HomeSet::Created) => vec![Reply::translated(
+                "horizon.anarchy.home.set",
+                &[Text::literal(name)],
+            )],
+            Ok(HomeSet::Updated) => vec![Reply::translated(
+                "horizon.anarchy.home.updated",
+                &[Text::literal(name)],
+            )],
+            Ok(HomeSet::Full) => vec![Reply::translated(
+                "horizon.anarchy.home.full",
+                &[Text::literal(HOME_LIMIT.to_string())],
+            )],
             Err(e) => {
                 dedicated::log("ERROR", &format!("sethome failed: {e}"));
                 vec![unknown()]
@@ -1480,7 +1895,13 @@ impl Game<'_> {
     }
 
     /// `/home <name>`: to one of the player's homes, in its dimension.
-    fn anarchy_home(&mut self, host: &mut LanHost, conn: u32, uuid: u128, args: &[&str]) -> Vec<Reply> {
+    fn anarchy_home(
+        &mut self,
+        host: &mut LanHost,
+        conn: u32,
+        uuid: u128,
+        args: &[&str],
+    ) -> Vec<Reply> {
         let Some(name) = args.first().copied() else {
             return vec![Reply::translated("horizon.anarchy.home.invalid", &[])];
         };
@@ -1504,7 +1925,10 @@ impl Game<'_> {
             cause: None,
         });
         self.run_level_teleports(host);
-        vec![Reply::translated("horizon.anarchy.home.went", &[Text::literal(&home.name)])]
+        vec![Reply::translated(
+            "horizon.anarchy.home.went",
+            &[Text::literal(&home.name)],
+        )]
     }
 
     /// `/delhome <name>`.
@@ -1516,7 +1940,10 @@ impl Game<'_> {
             return vec![];
         };
         match anarchy.store.delete_home(uuid, name) {
-            Ok(true) => vec![Reply::translated("horizon.anarchy.home.deleted", &[Text::literal(name)])],
+            Ok(true) => vec![Reply::translated(
+                "horizon.anarchy.home.deleted",
+                &[Text::literal(name)],
+            )],
             Ok(false) => vec![Reply::translated("horizon.anarchy.home.notfound", &[])],
             Err(e) => {
                 dedicated::log("ERROR", &format!("delhome failed: {e}"));
@@ -1531,7 +1958,9 @@ impl Game<'_> {
             return vec![];
         };
         match anarchy.store.home_names(uuid) {
-            Ok(names) if names.is_empty() => vec![Reply::translated("horizon.anarchy.home.empty", &[])],
+            Ok(names) if names.is_empty() => {
+                vec![Reply::translated("horizon.anarchy.home.empty", &[])]
+            }
             Ok(names) => vec![Reply::translated(
                 "horizon.anarchy.home.list",
                 &[
@@ -1628,14 +2057,12 @@ impl Game<'_> {
                     .with_color(horizon_client::text::GRAY),
                 Reply::literal("/delhome <name> - Delete a home")
                     .with_color(horizon_client::text::GRAY),
-                Reply::literal("/homes - List your homes")
-                    .with_color(horizon_client::text::GRAY),
+                Reply::literal("/homes - List your homes").with_color(horizon_client::text::GRAY),
                 Reply::literal("/rtp (or /randomtp) - Teleport to a random spot near spawn")
                     .with_color(horizon_client::text::GRAY),
                 Reply::literal("/playerstats [player] - Join date, playtime and homes")
                     .with_color(horizon_client::text::GRAY),
-                Reply::literal("/kill - Commit suicide")
-                    .with_color(horizon_client::text::GRAY),
+                Reply::literal("/kill - Commit suicide").with_color(horizon_client::text::GRAY),
             ]
         }
     }
@@ -1709,18 +2136,33 @@ impl Game<'_> {
             return vec![];
         };
         if !anarchy.store.has_account(uuid) {
-            dedicated::log("INFO", &format!("{name} tried /login with no account (register first)"));
+            dedicated::log(
+                "INFO",
+                &format!("{name} tried /login with no account (register first)"),
+            );
             return vec![Reply::translated("horizon.anarchy.login.none", &[])];
         }
         let now = Instant::now();
         match anarchy.login.gate(ip, uuid, now) {
             Brake::Account => {
-                dedicated::log("INFO", &format!("{name} ({ip}) tried /login on a locked account"));
-                return vec![Reply::translated("horizon.anarchy.login.account_locked", &[])];
+                dedicated::log(
+                    "INFO",
+                    &format!("{name} ({ip}) tried /login on a locked account"),
+                );
+                return vec![Reply::translated(
+                    "horizon.anarchy.login.account_locked",
+                    &[],
+                )];
             }
             Brake::Address => {
-                dedicated::log("INFO", &format!("{name} ({ip}) tried /login while its address is blocked"));
-                return vec![Reply::translated("horizon.anarchy.login.address_blocked", &[])];
+                dedicated::log(
+                    "INFO",
+                    &format!("{name} ({ip}) tried /login while its address is blocked"),
+                );
+                return vec![Reply::translated(
+                    "horizon.anarchy.login.address_blocked",
+                    &[],
+                )];
             }
             Brake::None => {}
         }
@@ -1728,15 +2170,33 @@ impl Game<'_> {
             anarchy.login.succeeded(ip, uuid);
         } else {
             let brake = anarchy.login.failed(ip, uuid, now);
-            dedicated::log("INFO", &format!("{name} ({ip}) gave the wrong password to /login"));
+            dedicated::log(
+                "INFO",
+                &format!("{name} ({ip}) gave the wrong password to /login"),
+            );
             return match brake {
                 Brake::Account => {
-                    dedicated::log("INFO", &format!("account of {name} locked: several addresses guessed at it"));
-                    vec![Reply::translated("horizon.anarchy.login.account_locked", &[])]
+                    dedicated::log(
+                        "INFO",
+                        &format!("account of {name} locked: several addresses guessed at it"),
+                    );
+                    vec![Reply::translated(
+                        "horizon.anarchy.login.account_locked",
+                        &[],
+                    )]
                 }
                 Brake::Address => {
-                    dedicated::log("INFO", &format!("{ip} blocked from /login for {} minutes", IP_BLOCK.as_secs() / 60));
-                    vec![Reply::translated("horizon.anarchy.login.address_blocked", &[])]
+                    dedicated::log(
+                        "INFO",
+                        &format!(
+                            "{ip} blocked from /login for {} minutes",
+                            IP_BLOCK.as_secs() / 60
+                        ),
+                    );
+                    vec![Reply::translated(
+                        "horizon.anarchy.login.address_blocked",
+                        &[],
+                    )]
                 }
                 Brake::None => vec![Reply::translated("horizon.anarchy.login.wrong", &[])],
             };
@@ -1833,7 +2293,11 @@ impl Game<'_> {
         if user.id == uuid {
             return vec![Reply::translated("horizon.anarchy.ignore.self", &[])];
         }
-        let toggled = match self.anarchy.as_ref().map(|a| a.store.toggle_ignore(uuid, &user)) {
+        let toggled = match self
+            .anarchy
+            .as_ref()
+            .map(|a| a.store.toggle_ignore(uuid, &user))
+        {
             Some(Ok(ignored)) => ignored,
             Some(Err(e)) => {
                 dedicated::log("ERROR", &format!("ignore failed: {e}"));
@@ -1869,12 +2333,9 @@ impl Game<'_> {
 
     /// `/addsocial`: the links `[anarchy] social` carries.
     fn anarchy_social(&self) -> Vec<Reply> {
-        let links: Vec<&str> = self
-            .anarchy
-            .as_ref()
-            .map_or(Vec::new(), |a| {
-                a.config.social.iter().map(|s| s.trim()).collect()
-            });
+        let links: Vec<&str> = self.anarchy.as_ref().map_or(Vec::new(), |a| {
+            a.config.social.iter().map(|s| s.trim()).collect()
+        });
         let links: Vec<&str> = links.into_iter().filter(|l| !l.is_empty()).collect();
         if links.is_empty() {
             return vec![Reply::translated("horizon.anarchy.social.none", &[])];
@@ -1929,13 +2390,13 @@ impl Game<'_> {
         let Some(g) = host.hub.guests.iter_mut().find(|g| g.conn == conn) else {
             return vec![];
         };
+        g.properties.retain(|p| p.name != "textures");
         g.properties
-            .retain(|p| p.name != "textures");
-        g.properties.push(horizon_protocol::packets::login::Property {
-            name: "textures".to_owned(),
-            value,
-            signature,
-        });
+            .push(horizon_protocol::packets::login::Property {
+                name: "textures".to_owned(),
+                value,
+                signature,
+            });
         // The entry is removed and re-added, so every client learns the new skin. The
         // re-add is the join's own tab entry (listed, with its game mode).
         let Some((name, mode)) = host
@@ -2023,7 +2484,10 @@ fn world_name() -> String {
 }
 
 /// The calendar age of `created` against now: whole years, months and days.
-fn calendar_age(created: chrono::DateTime<chrono::Utc>, now: chrono::DateTime<chrono::Utc>) -> (i64, i64, i64) {
+fn calendar_age(
+    created: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (i64, i64, i64) {
     use chrono::Datelike;
     let mut years = i64::from(now.year() - created.year());
     let mut months = i64::from(now.month() as i32 - created.month() as i32);
@@ -2032,9 +2496,13 @@ fn calendar_age(created: chrono::DateTime<chrono::Utc>, now: chrono::DateTime<ch
         months -= 1;
         // The days of the month before `now`'s (December of the year before
         // when `now` is in January).
-        let previous_month = if now.month() == 1 { 12 } else { now.month() - 1 };
-        let previous = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-            [previous_month as usize - 1];
+        let previous_month = if now.month() == 1 {
+            12
+        } else {
+            now.month() - 1
+        };
+        let previous =
+            [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][previous_month as usize - 1];
         days += i64::from(previous);
         if previous_month == 2 {
             let leap = now.year() % 4 == 0 && (now.year() % 100 != 0 || now.year() % 400 == 0);
@@ -2106,7 +2574,9 @@ fn fetch_skin(nickname: &str) -> Option<(String, Option<String>)> {
         "https://sessionserver.mojang.com/session/minecraft/profile/{id}?unsigned=false"
     ))?;
     let properties = body.get("properties")?.as_array()?;
-    let textures = properties.iter().find(|p| p.get("name").and_then(|n| n.as_str()) == Some("textures"))?;
+    let textures = properties
+        .iter()
+        .find(|p| p.get("name").and_then(|n| n.as_str()) == Some("textures"))?;
     let value = textures.get("value")?.as_str()?.to_owned();
     let signature = textures
         .get("signature")
@@ -2167,7 +2637,11 @@ mod tests {
         let seen = std::cell::Cell::new(0);
         let pick = pick_random_spawn(&mut unit, |_, _| {
             seen.set(seen.get() + 1);
-            if seen.get() < 3 { Column::Unsafe } else { Column::Ground(64) }
+            if seen.get() < 3 {
+                Column::Unsafe
+            } else {
+                Column::Ground(64)
+            }
         });
         assert!(matches!(pick, Pick::Found(_)));
         assert_eq!(seen.get(), 3);
@@ -2200,7 +2674,10 @@ mod tests {
         assert_eq!(guard.failed(a, 1, now), Brake::None);
         assert_eq!(guard.failed(a, 1, now), Brake::Address);
         assert_eq!(guard.gate(a, 2, now), Brake::Address);
-        assert_eq!(guard.gate(a, 2, now + IP_BLOCK + Duration::from_secs(1)), Brake::None);
+        assert_eq!(
+            guard.gate(a, 2, now + IP_BLOCK + Duration::from_secs(1)),
+            Brake::None
+        );
     }
 
     #[test]
@@ -2213,8 +2690,22 @@ mod tests {
         let last = (0..3).map(|_| guard.failed(ip("10.0.0.2"), 7, now)).last();
         assert_eq!(last, Some(Brake::Account));
         assert_eq!(guard.gate(ip("10.0.0.3"), 7, now), Brake::Account);
-        assert_eq!(guard.gate(ip("10.0.0.3"), 7, now + ACCOUNT_LOCK - Duration::from_secs(1)), Brake::Account);
-        assert_eq!(guard.gate(ip("10.0.0.3"), 7, now + ACCOUNT_LOCK + Duration::from_secs(1)), Brake::None);
+        assert_eq!(
+            guard.gate(
+                ip("10.0.0.3"),
+                7,
+                now + ACCOUNT_LOCK - Duration::from_secs(1)
+            ),
+            Brake::Account
+        );
+        assert_eq!(
+            guard.gate(
+                ip("10.0.0.3"),
+                7,
+                now + ACCOUNT_LOCK + Duration::from_secs(1)
+            ),
+            Brake::None
+        );
     }
 
     #[test]
@@ -2306,7 +2797,10 @@ mod tests {
         );
         assert_eq!(store.import(&text), Ok(1));
         assert!(store.has_account(42));
-        assert_eq!(store.ignores_of(42).unwrap(), vec![(7u128, "Bo".to_owned())]);
+        assert_eq!(
+            store.ignores_of(42).unwrap(),
+            vec![(7u128, "Bo".to_owned())]
+        );
         // A second import changes nothing.
         assert_eq!(store.import(&text), Ok(1));
         assert_eq!(store.ignores_of(42).unwrap().len(), 1);
@@ -2323,10 +2817,14 @@ mod tests {
     fn the_calendar_age_counts_years_months_and_days() {
         use chrono::TimeZone;
         let created = chrono::Utc.with_ymd_and_hms(2020, 8, 29, 12, 0, 0).unwrap();
-        let now = chrono::Utc.with_ymd_and_hms(2026, 11, 15, 12, 0, 0).unwrap();
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 11, 15, 12, 0, 0)
+            .unwrap();
         assert_eq!(calendar_age(created, now), (6, 2, 17));
         // A month's end rolls into the next unit, never negative.
-        let created = chrono::Utc.with_ymd_and_hms(2026, 11, 30, 12, 0, 0).unwrap();
+        let created = chrono::Utc
+            .with_ymd_and_hms(2026, 11, 30, 12, 0, 0)
+            .unwrap();
         let now = chrono::Utc.with_ymd_and_hms(2026, 12, 1, 12, 0, 0).unwrap();
         let (years, months, days) = calendar_age(created, now);
         assert_eq!((years, months, days), (0, 0, 1));

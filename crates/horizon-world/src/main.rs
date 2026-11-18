@@ -54,7 +54,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
             "Horizon world data tools — Java Edition {}\n\
              inspect <region.mca>\n\
              copy-region <source.mca> <new-directory/r.x.z.mca> [gzip|zlib|none|lz4]\n\
-             merge-linear <world-folder> [--dry-run]\n\
+             convert-linear-v2 <world-folder> <--dry-run|staging-directory>\n\
              get-block <region.mca> <x> <y> <z>\n\
              edit-block-data <source.mca> <new-directory/r.x.z.mca> <x> <y> <z> <name> [property=value ...]\n\
              nbt-copy <input> <new-output> <input-codec> <output-codec>\n\
@@ -105,17 +105,11 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
                 );
             }
         }
-        "merge-linear" if args.len() == 2 || (args.len() == 3 && args[2] == "--dry-run") => {
-            let dry_run = args.len() == 3;
-            let report = horizon_world::linear_merge::merge_world(Path::new(&args[1]), dry_run)?;
-            println!(
-                "{} region(s) merged, {} restored; {} chunk(s) from .linear, {} from the original .mca{}",
-                report.merged,
-                report.restored,
-                report.from_linear,
-                report.from_original,
-                if dry_run { " (dry run, nothing written)" } else { "" }
-            );
+        "convert-linear-v2" if args.len() == 3 => {
+            let staging = (args[2] != "--dry-run").then(|| Path::new(&args[2]));
+            let (regions, chunks) =
+                horizon_world::linear_v2::convert_world(Path::new(&args[1]), staging)?;
+            println!("Verified {regions} Linear v2 regions with {chunks} chunks");
         }
         "copy-region" if args.len() == 3 || args.len() == 4 => {
             let mut region = RegionFile::open(&args[1])?;

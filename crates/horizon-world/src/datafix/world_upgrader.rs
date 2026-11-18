@@ -265,6 +265,12 @@ impl RegionStorageUpgrader {
     /// done, not after every chunk: a sync per chunk (vanilla opens the files
     /// `DSYNC`) costs more than the chunk's whole upgrade.
     fn upgrade_file(&self, file: &FileToUpgrade) {
+        if let Ok(position) = crate::linear_v2::position_from_path(&file.path) {
+            if let Err(error) = self.upgrade_linear_file(file, position) {
+                eprintln!("Failed to upgrade {}: {error}", file.path.display());
+            }
+            return;
+        }
         let mut open = OpenFiles::default();
         let mut converted = true;
         for &pos in &file.chunks {
@@ -289,6 +295,50 @@ impl RegionStorageUpgrader {
                 eprintln!("Failed to convert region file {}", file.path.display());
             }
         }
+    }
+
+    fn upgrade_linear_file(&self, file: &FileToUpgrade, position: ChunkPos) -> io::Result<()> {
+        let region = crate::linear_v2::Region::open(&file.path, position)?;
+        let mut chunks = region.chunks()?;
+        let limits = Limits::default();
+        let mut converted = 0;
+        let mut skipped = 0;
+        for &pos in &file.chunks {
+            if self.progress.is_canceled() {
+                return Ok(());
+            }
+            let slot = (pos.x.rem_euclid(32) + 32 * pos.z.rem_euclid(32)) as usize;
+            let chunk = chunks[slot]
+                .as_mut()
+                .ok_or_else(|| io::Error::other("chunk vanished"))?;
+            let (mut root, _) =
+                crate::nbt::read_named(&chunk.nbt, limits).map_err(io::Error::other)?;
+            let mut changed = as_int(root.tag.get("DataVersion"), -1) < CURRENT;
+            for (&needed_version, modifier) in &self.builder.tag_modifiers {
+                self.upgrade_tag(&mut root.tag, needed_version);
+                changed |= modifier(pos, &mut root.tag);
+            }
+            self.upgrade_tag(&mut root.tag, CURRENT);
+            if changed || self.builder.recreate_region_files {
+                chunk.nbt = crate::nbt::write_named(&root, limits).map_err(io::Error::other)?;
+                converted += 1;
+            } else {
+                skipped += 1;
+            }
+        }
+        if self.progress.is_canceled() {
+            return Ok(());
+        }
+        if converted > 0 {
+            region.save(&file.path, &chunks)?;
+        }
+        for _ in 0..converted {
+            self.progress.increment_converted();
+        }
+        for _ in 0..skipped {
+            self.progress.increment_skipped();
+        }
+        Ok(())
     }
 
     /// `processOnePosition`: an IO error skips the chunk, the logged way.
@@ -443,6 +493,28 @@ fn all_chunk_positions(folder: &Path) -> Vec<FileToUpgrade> {
             .unwrap_or_default()
             .to_string_lossy()
             .into_owned();
+        if let Ok(position) = crate::linear_v2::position_from_path(&path) {
+            match crate::linear_v2::Region::open(&path, position).and_then(|region| region.chunks())
+            {
+                Ok(slots) => {
+                    let chunks: Vec<_> = (0..32)
+                        .flat_map(|x| (0..32).map(move |z| (x, z)))
+                        .filter(|&(x, z)| slots[(x + z * 32) as usize].is_some())
+                        .map(|(x, z)| {
+                            ChunkPos::new(
+                                position.x.wrapping_shl(5) + x,
+                                position.z.wrapping_shl(5) + z,
+                            )
+                        })
+                        .collect();
+                    if !chunks.is_empty() {
+                        out.push(FileToUpgrade { path, chunks });
+                    }
+                }
+                Err(error) => eprintln!("Failed to read chunks from {}: {error}", path.display()),
+            }
+            continue;
+        }
         let Some((rx, rz)) = region_coordinates(&name) else {
             continue;
         };

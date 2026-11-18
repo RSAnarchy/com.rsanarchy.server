@@ -217,7 +217,9 @@ impl Game<'_> {
         for event in &events {
             match click_action(event) {
                 Some(ClickAction::RunCommand(command)) => {
-                    if allow_op_features {
+                    if allow_op_features
+                        && !self.anarchy.as_ref().is_some_and(|a| a.config.prevent_command_sign)
+                    {
                         self.run_sign_command(pos, &command);
                     }
                     any_click_command = true;
@@ -576,6 +578,23 @@ impl Game<'_> {
         };
         let (uuid, name) = (g.uuid, g.name.clone());
         let key = (p.pos[0], p.pos[1], p.pos[2]);
+        if let Some(anarchy) = &self.anarchy {
+            let config = &anarchy.config;
+            let lengths = p.lines.iter().map(|line| line.encode_utf16().count());
+            if lengths.clone().any(|length| config.sign_line_character_limit > 0
+                && length > config.sign_line_character_limit)
+                || (config.sign_total_character_limit > 0
+                    && lengths.sum::<usize>() > config.sign_total_character_limit)
+            {
+                if matches!(self.world.block_entities.get(&key),
+                    Some(BlockEntity::Sign(sign)) if sign.allowed_editor == Some(uuid))
+                {
+                    self.world.block_entities.set_sign_editor(key, None);
+                    self.mark_block_entity_updated(key);
+                }
+                return;
+            }
+        }
         let lines = p.lines.join(" ");
         if !self.chat_filter_text(
             host,

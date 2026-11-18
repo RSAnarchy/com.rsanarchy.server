@@ -307,6 +307,22 @@ pub struct Anarchy {
     /// false: no world border. The saved border is ignored, and a `/worldborder` change is undone
     /// each tick. Needs `enabled = true`.
     pub world_border: bool,
+    pub falling_blocks_per_chunk: Option<usize>,
+    pub experience_bottles_per_chunk: Option<usize>,
+    pub dropped_items_per_chunk: usize,
+    pub minecarts_per_chunk: usize,
+    pub vehicles_per_chunk: usize,
+    pub projectile_max_age_ticks: u32,
+    pub projectile_age_limits: std::collections::BTreeMap<String, u32>,
+    pub villagers_per_chunk: usize,
+    pub block_entities_per_chunk: usize,
+    pub lever_uses_per_two_seconds: u32,
+    pub inventory_opens_per_second: u32,
+    pub villager_removal_priority: Vec<String>,
+    pub mob_limits_per_chunk: std::collections::BTreeMap<String, usize>,
+    pub prevent_command_sign: bool,
+    pub sign_line_character_limit: usize,
+    pub sign_total_character_limit: usize,
 }
 impl Default for Anarchy {
     fn default() -> Self {
@@ -321,6 +337,44 @@ impl Default for Anarchy {
             dupe_radius: 10.0,
             dupe_ends_unix: 0,
             world_border: true,
+            // High-playercount anarchy defaults: prevent common lag machines without
+            // being overly restrictive. Tune per-server in server.toml [anarchy].
+            falling_blocks_per_chunk: Some(60),
+            experience_bottles_per_chunk: Some(25),
+            dropped_items_per_chunk: 300,
+            minecarts_per_chunk: 40,
+            vehicles_per_chunk: 60,
+            // Global projectile cleanup (ender pearls/wither skulls are exempted at runtime).
+            projectile_max_age_ticks: 300,
+            projectile_age_limits: Default::default(),
+            villagers_per_chunk: 0,
+            block_entities_per_chunk: 1000,
+            lever_uses_per_two_seconds: 30,
+            inventory_opens_per_second: 20,
+            villager_removal_priority: [
+                "none",
+                "nitwit",
+                "shepherd",
+                "fisherman",
+                "butcher",
+                "cartographer",
+                "leatherworker",
+                "fletcher",
+                "mason",
+                "farmer",
+                "armorer",
+                "toolsmith",
+                "weaponsmith",
+                "cleric",
+                "librarian",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            mob_limits_per_chunk: Default::default(),
+            prevent_command_sign: true,
+            sign_line_character_limit: 80,
+            sign_total_character_limit: 384,
         }
     }
 }
@@ -370,10 +424,7 @@ impl Tablist {
     fn check(&self) -> Result<(), String> {
         if !self.header_color.is_empty()
             && (self.header_color.len() != 6
-                || !self
-                    .header_color
-                    .chars()
-                    .all(|c| c.is_ascii_hexdigit()))
+                || !self.header_color.chars().all(|c| c.is_ascii_hexdigit()))
         {
             return Err("tablist.header_color must be six hex digits (RGB)".into());
         }

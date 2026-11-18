@@ -13,6 +13,8 @@
 //! level.dat, player data, stats or advancements.
 
 use horizon_platform::world::{
+    compression::Compression,
+    linear_v2,
     nbt::{self, Limits, Tag},
     region::{ChunkRecord, RegionFile, RegionWriter, position_from_path},
 };
@@ -122,6 +124,7 @@ fn slot(c: Chunk) -> usize {
 /// A region file's header, read without its chunks.
 struct Header {
     len: u64,
+    linear: bool,
     /// Each slot's sector count (0: no chunk).
     sectors: [u8; 1024],
     /// A chunk too big for the file lives in its own `.mcc` file: such regions are left as they are.
@@ -129,6 +132,10 @@ struct Header {
 }
 
 fn header(path: &Path) -> io::Result<Header> {
+    if let Ok(position) = linear_v2::position_from_path(path) {
+        let chunks = linear_v2::Region::open(path, position)?.chunks()?;
+        return linear_header(path, &chunks);
+    }
     let mut file = fs::File::open(path)?;
     let len = file.metadata()?.len();
     // As vanilla's RegionFile: a short file reads as far as it goes, and entries that overlap the header,
@@ -153,9 +160,18 @@ fn header(path: &Path) -> io::Result<Header> {
     }
     Ok(Header {
         len,
+        linear: false,
         sectors,
         oversized,
     })
+}
+
+fn linear_header(path: &Path, chunks: &[Option<linear_v2::Chunk>]) -> io::Result<Header> {
+    let mut sectors = [0; 1024];
+    for (weight, chunk) in sectors.iter_mut().zip(chunks) {
+        *weight = u8::from(chunk.is_some());
+    }
+    Ok(Header { len: fs::metadata(path)?.len(), linear: true, sectors, oversized: false })
 }
 
 /// What a compacted file would hold without `drop`: its new length (0: deleted).
@@ -164,7 +180,15 @@ fn compacted_len(h: &Header, gone: &Bits) -> u64 {
         .filter(|&i| h.sectors[i] != 0 && !gone.has(i))
         .map(|i| u64::from(h.sectors[i]))
         .sum();
-    if kept == 0 { 0 } else { (2 + kept) * SECTOR }
+    if kept == 0 {
+        0
+    } else if h.linear {
+        // Compressed buckets make exact dry-run sizing require a recompression.
+        let total: u64 = h.sectors.iter().map(|&weight| u64::from(weight)).sum();
+        h.len.saturating_mul(kept) / total
+    } else {
+        (2 + kept) * SECTOR
+    }
 }
 
 /// One region file of chunks after the scan.
@@ -182,6 +206,29 @@ enum Scan {
 
 fn scan_region(path: &Path, min_ticks: i64) -> Scan {
     let result = (|| -> io::Result<Scan> {
+        if let Ok(position) = linear_v2::position_from_path(path) {
+            let chunks = linear_v2::Region::open(path, position)?.chunks()?;
+            let header = linear_header(path, &chunks)?;
+            let (mut present, mut busy, mut unreadable) = (Bits::default(), Bits::default(), 0);
+            for (index, chunk) in chunks.into_iter().enumerate() {
+                let Some(chunk) = chunk else { continue };
+                present.set(index);
+                let record = ChunkRecord {
+                    compression: Compression::None,
+                    compressed: chunk.nbt,
+                    timestamp: 0,
+                };
+                match inhabited(&record) {
+                    Some(ticks) if ticks < min_ticks => {}
+                    Some(_) => busy.set(index),
+                    None => {
+                        busy.set(index);
+                        unreadable += 1;
+                    }
+                }
+            }
+            return Ok(Scan::Read { present, busy, unreadable, header });
+        }
         let header = header(path)?;
         let mut file = RegionFile::open(path)?;
         let (mut present, mut busy, mut unreadable) = (Bits::default(), Bits::default(), 0);
@@ -480,7 +527,7 @@ fn region_files(folder: &Path) -> Vec<(Chunk, PathBuf)> {
         .flatten()
         .filter_map(|e| {
             let p = e.path();
-            let at = position_from_path(&p).ok()?;
+            let at = linear_v2::position_from_path(&p).or_else(|_| position_from_path(&p)).ok()?;
             p.is_file().then_some(((at.x, at.z), p))
         })
         .collect();
@@ -516,6 +563,20 @@ fn parallel<T: Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(&T) -> R +
 
 /// Writes the kept chunks to a staged file; no file means the region will be removed.
 fn stage(path: &Path, staged: &Path, gone: &Bits) -> io::Result<()> {
+    if let Ok(position) = linear_v2::position_from_path(path) {
+        let region = linear_v2::Region::open(path, position)?;
+        let mut chunks = region.chunks()?;
+        for (index, chunk) in chunks.iter_mut().enumerate() {
+            if gone.has(index) {
+                *chunk = None;
+            }
+        }
+        if chunks.iter().any(Option::is_some) {
+            region.save(staged, &chunks)?;
+            fs::set_permissions(staged, fs::metadata(path)?.permissions())?;
+        }
+        return Ok(());
+    }
     let mut source = RegionFile::open(path)?;
     let chunks: Vec<_> = source.chunks().map(|(c, _)| c).collect();
     let mut writer = None;
@@ -696,7 +757,10 @@ pub fn run(
             if gone.count() == 0 {
                 continue;
             }
-            let name = format!("r.{rx}.{rz}.mca");
+            let mut name = format!("r.{rx}.{rz}.linear");
+            if !dim.folder.join("region").join(&name).is_file() {
+                name = format!("r.{rx}.{rz}.mca");
+            }
             let others: io::Result<Vec<_>> = KINDS[1..]
                 .iter()
                 .map(|kind| dim.folder.join(kind).join(&name))

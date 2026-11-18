@@ -248,6 +248,10 @@ pub fn run(dir: &Path) -> Result<(), String> {
         let written = config
             .write_properties(dir)
             .map_err(|e| format!("server.properties: {e}"))?;
+        let world = dir.join(&config.world.name);
+        crate::prune::recover(&world)?;
+        horizon_platform::world::linear_v2::check_world(&world)
+            .map_err(|error| error.to_string())?;
         prepare_world(&shared, dir, &config)?;
         note(
             &shared,

@@ -175,7 +175,11 @@ pub fn compress_records_with_pool(
     if count == 0 {
         return Vec::new();
     }
-    let compression = Compression::selected();
+    let compression = if super::dedicated_linear() {
+        Compression::None
+    } else {
+        Compression::selected()
+    };
     let compress = move |record: &Record| {
         record
             .tag()

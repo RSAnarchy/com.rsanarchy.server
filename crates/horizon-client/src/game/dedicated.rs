@@ -1151,6 +1151,8 @@ impl Game<'_> {
         self.native_lifecycle_open_started();
         // The registries the server sends are read while the world prepares.
         let sync = super::lan::preload_sync_data(&self.options.resources);
+        horizon_world::linear_v2::check_world(&world_dir)?;
+        horizon_client::save::use_dedicated_linear_storage();
         self.load_world(WorldRequest::new(
             &folder,
             Some(&level_name),

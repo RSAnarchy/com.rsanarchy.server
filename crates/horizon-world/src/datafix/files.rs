@@ -10,6 +10,7 @@ use super::schema::Ty;
 use super::world_upgrader::worker_threads;
 use super::{CURRENT, update};
 use crate::compression::Compression;
+use crate::linear_v2;
 use crate::nbt::{self, Compound, JavaString, Limits, NamedTag, Tag};
 use crate::region::{ChunkRecord, RegionFile, RegionWriter};
 use std::fs;
@@ -753,7 +754,9 @@ fn upgrade_regions_with_threads(
     fix: impl Fn(&mut Tag) + Sync,
     threads: usize,
 ) -> io::Result<()> {
-    let files = files_with_suffix(folder, ".mca");
+    let mut files = files_with_suffix(folder, ".mca");
+    files.extend(files_with_suffix(folder, ".linear"));
+    files.sort();
     if files.is_empty() {
         return Ok(());
     }
@@ -805,6 +808,25 @@ fn upgrade_regions_with_threads(
 /// of a large world's are empty) has nothing to fix and is left as it is.
 fn upgrade_region_file(path: &Path, staging: &Path, fix: &impl Fn(&mut Tag)) -> io::Result<()> {
     let limits = Limits::default();
+    if path
+        .extension()
+        .is_some_and(|extension| extension == "linear")
+    {
+        let position = linear_v2::position_from_path(path)?;
+        let region = linear_v2::Region::open(path, position)?;
+        let mut chunks = region.chunks()?;
+        for chunk in chunks.iter_mut().flatten() {
+            let (mut root, _) = nbt::read_named(&chunk.nbt, limits)
+                .map_err(|error| crate::compression::invalid(error.to_string()))?;
+            fix(&mut root.tag);
+            chunk.nbt = nbt::write_named(&root, limits)
+                .map_err(|error| crate::compression::invalid(error.to_string()))?;
+        }
+        if chunks.iter().any(Option::is_some) {
+            region.save(path, &chunks)?;
+        }
+        return Ok(());
+    }
     let mut region = RegionFile::open(path)?;
     let positions: Vec<_> = region.chunks().map(|(p, _)| p).collect();
     if positions.is_empty() {
@@ -990,7 +1012,9 @@ pub fn upgrade_world_data_with(
     total += saved_data_files(&base.join("data"))?.len();
     for (_, dim) in &dimensions {
         for folder in ["region", "entities", "poi"] {
-            total += files_with_suffix(&dim.join(folder), ".mca").len();
+            let folder = dim.join(folder);
+            total += files_with_suffix(&folder, ".mca").len()
+                + files_with_suffix(&folder, ".linear").len();
         }
         total += saved_data_files(&dim.join("data"))?.len();
     }

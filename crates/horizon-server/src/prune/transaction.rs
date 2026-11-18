@@ -93,8 +93,9 @@ pub(super) fn recover_with(
         return clean(folder);
     }
     let journal: Journal = serde_json::from_slice(&fs::read(journal)?)?;
-    let valid_name = horizon_platform::world::region::position_from_path(Path::new(&journal.name))
-        .is_ok()
+    let path = Path::new(&journal.name);
+    let valid_name = (horizon_platform::world::region::position_from_path(path).is_ok()
+        || horizon_platform::world::linear_v2::position_from_path(path).is_ok())
         && Path::new(&journal.name)
             .file_name()
             .is_some_and(|n| n == journal.name.as_str());
