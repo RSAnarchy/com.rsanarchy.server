@@ -2462,7 +2462,15 @@ impl Game<'_> {
         let size = dir_size(&dir);
         out.push(Reply::translated(
             "horizon.worldstats.size",
-            &[gold(format!("{:.2}", size as f64 / 1_000_000_000.0))],
+            &[gold(format_size_triplet(size))],
+        ));
+        // Rough estimate: MCA regions are typically ~1.8x the size of Linear v2
+        // for comparable data, so savings ~= 0.8 * current linear world size.
+        const LINEAR_VS_MCA_SAVINGS_FACTOR: f64 = 0.8;
+        let saved = (size as f64 * LINEAR_VS_MCA_SAVINGS_FACTOR) as u64;
+        out.push(Reply::translated(
+            "horizon.worldstats.linear_saved",
+            &[gold(format_size_auto(saved))],
         ));
         out
     }
@@ -2537,21 +2545,11 @@ fn calendar_age(
     (years.max(0), months.max(0), days.max(0))
 }
 
-/// How old the map is: the world folder's (or its level.dat's) creation.
-fn map_age(dir: &PathBuf) -> (i64, i64, i64) {
-    let created = std::fs::metadata(dir)
-        .ok()
-        .filter(|m| m.created().is_ok())
-        .and_then(|m| m.created().ok())
-        .or_else(|| {
-            std::fs::metadata(dir.join("level.dat"))
-                .ok()
-                .and_then(|m| m.created().ok())
-        });
-    let Some(created) = created else {
-        return (0, 0, 0);
-    };
-    let created: chrono::DateTime<chrono::Utc> = created.into();
+/// How old the map is. Forced to the known RSAnarchy world creation date
+/// (filesystem timestamps were corrupted during Linear conversion).
+fn map_age(_dir: &PathBuf) -> (i64, i64, i64) {
+    use chrono::TimeZone;
+    let created = chrono::Utc.with_ymd_and_hms(2026, 8, 8, 0, 0, 0).unwrap();
     calendar_age(created, chrono::Utc::now())
 }
 
@@ -2576,6 +2574,29 @@ fn dir_size(dir: &PathBuf) -> u64 {
         }
     }
     total
+}
+
+/// Formats a byte size as "X.XX MB, X.XX GB, X.XXXXX TB".
+fn format_size_triplet(bytes: u64) -> String {
+    let b = bytes as f64;
+    format!(
+        "{:.2} MB, {:.2} GB, {:.5} TB",
+        b / 1_000_000.0,
+        b / 1_000_000_000.0,
+        b / 1_000_000_000_000.0
+    )
+}
+
+/// Formats a byte size in the most appropriate unit (MB, GB, or TB).
+fn format_size_auto(bytes: u64) -> String {
+    let b = bytes as f64;
+    if b >= 1_000_000_000_000.0 {
+        format!("{:.2} TB", b / 1_000_000_000_000.0)
+    } else if b >= 1_000_000_000.0 {
+        format!("{:.2} GB", b / 1_000_000_000.0)
+    } else {
+        format!("{:.2} MB", b / 1_000_000.0)
+    }
 }
 
 /// The textures property of the profile named `nickname` (the services'
