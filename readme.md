@@ -3,19 +3,6 @@
 A server fork of [Horizon](https://github.com/horizon-rust/horizon), a Rust port of Minecraft Java Edition 26.3, run for .RS Anarchy.
 
 
-## Building
-
-Needs Rust 1.95 or newer. The client build also needs the generated mod-API inputs at the repo root, which are included: `native-hooks.json`, `tools/native-hook-fragments/`, and `packaging/`. Don't delete them.
-
-On Windows, `_build.and.deploy.ps1` builds both binaries and copies them into the server folder. From the repo:
-
-```powershell
-.\_build.and.deploy.ps1           # build, copy, verify
-.\_build.and.deploy.ps1 -Start    # also start the server
-```
-
-To build the Linux binaries from Windows through WSL, use `scripts\build-wsl.ps1`. It writes them to `dist\linux`. Ubuntu 24.04 is the tested distro. On a Linux machine, `scripts/build-linux.sh` does the same build.
-
 ## Anarchy extras
 
 These are optional and configured in the `[anarchy]` section of `server.toml`:
