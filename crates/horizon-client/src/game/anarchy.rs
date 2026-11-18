@@ -222,6 +222,9 @@ pub(super) struct AnarchyConfig {
     pub projectile_max_age_ticks: u32,
     pub projectile_age_limits: std::collections::BTreeMap<String, u32>,
     pub villagers_per_chunk: usize,
+    /// Maximum primed TNT entities allowed per chunk. Excess TNT is removed to
+    /// prevent lag machines/crashes in destroyed anarchy areas (0 disables).
+    pub primed_tnt_per_chunk: usize,
     pub block_entities_per_chunk: usize,
     pub lever_uses_per_two_seconds: u32,
     pub inventory_opens_per_second: u32,
@@ -255,6 +258,9 @@ impl Default for AnarchyConfig {
             projectile_max_age_ticks: 300,
             projectile_age_limits: Default::default(),
             villagers_per_chunk: 0,
+            // Primed TNT is extremely expensive in bulk; cap per chunk to prevent
+            // lag/crash machines while still allowing normal TNT use.
+            primed_tnt_per_chunk: 40,
             block_entities_per_chunk: 1000,
             lever_uses_per_two_seconds: 30,
             inventory_opens_per_second: 20,
@@ -1645,6 +1651,19 @@ impl Game<'_> {
                 let count = counts.entry(key).or_insert(0);
                 *count += 1;
                 *count <= minecart_limit || occupied.contains(&cart.id)
+            });
+        }
+        let primed_tnt_limit = anarchy.config.primed_tnt_per_chunk;
+        if tick % 20 == 0 && primed_tnt_limit > 0 && self.tnts.len() > primed_tnt_limit {
+            let mut counts = std::collections::HashMap::new();
+            self.tnts.retain(|entity| {
+                let key = (
+                    entity.position.x.floor() as i32 >> 4,
+                    entity.position.z.floor() as i32 >> 4,
+                );
+                let count = counts.entry(key).or_insert(0);
+                *count += 1;
+                *count <= primed_tnt_limit
             });
         }
         if let Some(limit) = anarchy.config.falling_blocks_per_chunk

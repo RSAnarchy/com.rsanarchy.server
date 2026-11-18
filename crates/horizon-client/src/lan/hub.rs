@@ -3948,8 +3948,9 @@ impl Hub {
             self.guests[i].inbox_bytes -= bytes;
             budget -= 1;
             // Diagnostic (the cracked login): what a held player sends, by packet name.
+            // Kept at debug level to avoid log/CPU spam from held clients flooding packets.
             if self.login_hold.contains(&self.guests[i].uuid) {
-                log::warn!("Horizon login: {} sent packet {}", self.guests[i].name, packet.name());
+                log::debug!("Horizon login: {} sent packet {}", self.guests[i].name, packet.name());
             }
             // The login hold (game/anarchy.rs): a player who has not
             // authenticated sends nothing the world answers. Their chat and

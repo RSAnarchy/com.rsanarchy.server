@@ -315,6 +315,8 @@ pub struct Anarchy {
     pub projectile_max_age_ticks: u32,
     pub projectile_age_limits: std::collections::BTreeMap<String, u32>,
     pub villagers_per_chunk: usize,
+    /// Maximum primed TNT entities allowed per chunk (0 disables).
+    pub primed_tnt_per_chunk: usize,
     pub block_entities_per_chunk: usize,
     pub lever_uses_per_two_seconds: u32,
     pub inventory_opens_per_second: u32,
@@ -348,6 +350,7 @@ impl Default for Anarchy {
             projectile_max_age_ticks: 300,
             projectile_age_limits: Default::default(),
             villagers_per_chunk: 0,
+            primed_tnt_per_chunk: 40,
             block_entities_per_chunk: 1000,
             lever_uses_per_two_seconds: 30,
             inventory_opens_per_second: 20,
