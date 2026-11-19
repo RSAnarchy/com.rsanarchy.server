@@ -70,6 +70,8 @@ horizon-bots: load-test bots for a Minecraft Java Edition 26.3 server (offline m
                          other one 30 000 characters long), flood-book (100 pages of 1024 characters
                          into a writable book), flood-sign (four 384-character lines on the block
                          below), flood-recipe (recipe book placements)
+  --password P           Horizon anarchy auth password: bots auto-send /register P P and /login P after join;
+                         default botpass12345. Use --password none to disable.
   --ack-mode MODE        chunk batch feedback: vanilla (default) or 64 (fixed chunks per tick);
                          one ACK per completed batch; use explore for a controlled pacing test
   --flood N              packets a tick for the flood behaviours; default 100
@@ -191,6 +193,8 @@ struct Options {
     report: Option<String>,
     /// --capture: where the first bot's play packets go.
     capture: Option<String>,
+    /// Horizon anarchy auth password; bots auto-send /register and /login after join when set.
+    password: Option<String>,
     /// How many times as fast as vanilla's 20 Hz the bots tick (a timer cheat above 1).
     timer: f64,
 }
@@ -225,6 +229,7 @@ fn options() -> Result<Options, String> {
         report: None,
         capture: None,
         brand: None,
+        password: Some("botpass12345".into()),
         timer: 1.0,
     };
     let mut args = std::env::args().skip(1);
@@ -286,6 +291,13 @@ fn options() -> Result<Options, String> {
             "--report" => o.report = Some(value),
             "--capture" => o.capture = Some(value),
             "--brand" => o.brand = Some(value),
+            "--password" => {
+                if value.eq_ignore_ascii_case("none") {
+                    o.password = None;
+                } else {
+                    o.password = Some(value);
+                }
+            }
             "--give" => {
                 for part in value.split(',') {
                     let n: Vec<&str> = part.split(':').collect();
@@ -1180,6 +1192,19 @@ fn run_bot(
     if !o.no_loaded {
         send(raw(sb::PLAYER_LOADED, |_| {}));
     }
+    // Horizon anarchy servers hold players until /register or /login. Try both so fresh bots can
+    // create accounts and existing ones can still authenticate, without spamming chat/commands.
+    if let Some(password) = &o.password {
+        let register = format!("register {password} {password}");
+        let login = format!("login {password}");
+        let _ = send(
+            play::Serverbound::ChatCommand(play::ChatCommand { command: register })
+                .encode(),
+        );
+        let _ = send(
+            play::Serverbound::ChatCommand(play::ChatCommand { command: login }).encode(),
+        );
+    }
     bot.deaf.store(o.no_read, Ordering::Relaxed);
     // What the costly floods need in hand (creative: the server takes the bot's word for it).
     let tool = match behaviour {
@@ -1364,6 +1389,18 @@ fn run_bot(
                     .encode(),
                 );
             }
+        }
+        // Retry Horizon anarchy auth a couple of times in case the first attempt was too early.
+        if let Some(password) = &o.password && matches!(tick, 40 | 120) {
+            let register = format!("register {password} {password}");
+            let login = format!("login {password}");
+            let _ = send(
+                play::Serverbound::ChatCommand(play::ChatCommand { command: register })
+                    .encode(),
+            );
+            let _ = send(
+                play::Serverbound::ChatCommand(play::ChatCommand { command: login }).encode(),
+            );
         }
         for (at, id, body) in &o.raw {
             if *at == tick {

@@ -906,7 +906,7 @@
   "horizon.anarchy.skin.wait": "Wait a moment before another skin lookup",
   "horizon.worldstats.players": "The server has spawned %s player(s) at least once",
   "horizon.worldstats.map_age": "The map is %1$s year(s), %2$s month(s) and %3$s day(s) old",
-  "horizon.worldstats.size": "The world (in the `.linear` chunk format) is a total of %s",
+  "horizon.worldstats.size": "The world (in the .linear chunk format) is a total of %s",
   "horizon.worldstats.linear_saved": "The Linear chunk format has saved the server an estimated %s",
   "horizon.tablist.header": "\n%s\n",
   "horizon.tablist.footer": "\n%1$s TPS - %2$s players - %3$s ping - %4$s uptime\n",

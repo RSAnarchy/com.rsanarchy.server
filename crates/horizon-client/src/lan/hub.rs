@@ -3932,6 +3932,8 @@ impl Hub {
         g.known_moves = g.received_moves;
         // ServerPlayer.tick: tickClientLoadTimeout.
         g.load_timeout = g.load_timeout.saturating_sub(1);
+        let started = std::time::Instant::now();
+        const INBOX_TIME_BUDGET: std::time::Duration = std::time::Duration::from_millis(4);
         let mut budget = PACKETS_PER_TICK;
         // An action the game runs after this pass has a move queued behind it: the
         // move waits for the next tick, but the arm swing the client sent right after
@@ -3939,6 +3941,9 @@ impl Hub {
         // (the swing starts the attack strength again, #7817).
         let mut held = false;
         while budget > 0 {
+            if started.elapsed() >= INBOX_TIME_BUDGET {
+                break;
+            }
             if held && !matches!(self.guests[i].inbox.front(), Some((S::Punch(_), _))) {
                 break;
             }

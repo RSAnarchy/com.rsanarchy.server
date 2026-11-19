@@ -1304,6 +1304,11 @@ impl Game<'_> {
             lod_distance: horizon_client::lod_net::distance_property(
                 props.raw.get(horizon_client::lod_net::PROPERTY),
             ),
+            max_connections_per_ip: props
+                .raw
+                .get(horizon_client::lan::HORIZON_MAX_CONNECTIONS_PER_IP)
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(10),
             server_links: if props.bug_report_link.is_empty() {
                 Vec::new()
             } else if super::server_links::valid_untrusted_uri(&props.bug_report_link) {

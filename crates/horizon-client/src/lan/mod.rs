@@ -219,6 +219,8 @@ pub const ACCEPT_OLDER_CLIENTS: &str = "horizon-accept-older-clients";
 /// What a 26.2 client is told while only its packet ids are translated (#10404).
 pub const OLDER_CLIENTS_UNFINISHED: &str =
     "This server lets 26.2 join, but Horizon cannot translate 26.2 yet: join with 26.3";
+/// The server.properties key limiting simultaneous connections from one non-local address (0: no limit).
+pub const HORIZON_MAX_CONNECTIONS_PER_IP: &str = "horizon-max-connections-per-ip";
 
 /// How the server side of the network behaves: an integrated server's LAN
 /// uses the defaults, a dedicated server takes them from server.properties.
@@ -296,6 +298,9 @@ pub struct NetConfig {
     /// far, in chunks, the server samples far terrain for Horizon clients
     /// (`lod_net`); 0 serves none.
     pub lod_distance: u32,
+    /// Maximum simultaneous connections from one non-local/public address.
+    /// 0 disables the per-address limit. Local/private addresses are never limited.
+    pub max_connections_per_ip: usize,
     /// The shapes of the world's levels: their dimension types go to
     /// clients when the world's data packs changed them.
     pub levels: crate::chunk::LevelShapes,
@@ -343,6 +348,7 @@ impl NetConfig {
             accept_older_clients: false,
             older_clients_play: false,
             lod_distance: crate::lod_net::DEFAULT_DISTANCE,
+            max_connections_per_ip: 10,
             levels: crate::chunk::LevelShapes::VANILLA,
             owner_profile: None,
             singleplayer_profile: None,
@@ -837,13 +843,6 @@ impl Drop for Lan {
 /// Connections from the network accepted beyond the server's player limit.
 const SPARE_CONNECTIONS: usize = 64;
 
-/// Connections from one address at once (a household or a school behind one address plays well
-/// under it): past it a new one is closed, so that one machine can't take the places
-/// [`SPARE_CONNECTIONS`] leaves for everyone's logins and server-list pings. Not for a local or
-/// private address: a proxy, a tunnel or a container's port forward hands every player over from
-/// one of those.
-const PER_ADDRESS: usize = 10;
-
 /// Whether connections from `ip` may be many: it is this machine or the local network's.
 fn shared_address(ip: IpAddr) -> bool {
     match ip {
@@ -902,9 +901,10 @@ impl Shared {
     /// most and no connection that waits could be closed to make room ([`Shared::make_room`]).
     fn count(self: &Arc<Self>, ip: IpAddr) -> Option<Counted> {
         let most = self.max_players().saturating_add(SPARE_CONNECTIONS);
+        let per_address_limit = self.config.max_connections_per_ip;
         let here = |by: &HashMap<IpAddr, usize>| by.get(&ip).copied().unwrap_or(0);
         let by = self.by_address.lock().unwrap_or_else(|e| e.into_inner());
-        if here(&by) >= PER_ADDRESS && !shared_address(ip) {
+        if per_address_limit > 0 && here(&by) >= per_address_limit && !shared_address(ip) {
             return None;
         }
         // make_room logs, which reads by_address: never call it holding that lock.
@@ -1003,13 +1003,19 @@ impl Shared {
             })
             .collect::<Vec<_>>()
             .join(", ");
+        let per_address_limit = self.config.max_connections_per_ip;
+        let per_address = if per_address_limit == 0 {
+            "no per-address limit".to_owned()
+        } else {
+            format!("at most {per_address_limit} an address")
+        };
         (log.write)(
             "Server Connection Thread",
             "WARN",
             &format!(
                 "Turned away {count} connection(s), or closed one that waited to make room: {} of \
                  {most} places taken ({before_play} before play, {closing} closing), by \
-                 {addresses} address(es), most by {top} (at most {PER_ADDRESS} an address)",
+                 {addresses} address(es), most by {top} ({per_address})",
                 self.connections.load(Ordering::Acquire)
             ),
         );
@@ -1250,12 +1256,12 @@ mod tests {
         };
         let lan = Lan::start_with(Arc::new(data::SyncData::empty()), config).unwrap();
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();
-        let mut one: Vec<Counted> = (0..PER_ADDRESS)
+        let mut one: Vec<Counted> = (0..DEFAULT_MAX_CONNECTIONS_PER_IP)
             .map(|_| lan.shared.count(ip("203.0.113.7")).unwrap())
             .collect();
         assert!(lan.shared.count(ip("203.0.113.7")).is_none());
         assert!(lan.shared.count(ip("198.51.100.2")).is_some());
-        let local: Vec<Counted> = (0..PER_ADDRESS + 5)
+        let local: Vec<Counted> = (0..DEFAULT_MAX_CONNECTIONS_PER_IP + 5)
             .map(|_| lan.shared.count(ip("127.0.0.1")).unwrap())
             .collect();
         assert!(lan.shared.count(ip("172.17.0.1")).is_some());

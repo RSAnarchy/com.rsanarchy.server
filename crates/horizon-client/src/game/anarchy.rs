@@ -894,7 +894,7 @@ impl Store {
 
     fn init(conn: Connection) -> Result<Self, String> {
         let err = |e: rusqlite::Error| e.to_string();
-        conn.busy_timeout(Duration::from_secs(5)).map_err(err)?;
+        conn.busy_timeout(Duration::from_millis(100)).map_err(err)?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(err)?;
         conn.pragma_update(None, "synchronous", "NORMAL")
@@ -1157,7 +1157,7 @@ impl Store {
     }
 
     /// `homes`: the names a player has, A to Z.
-    fn home_names(&self, owner: u128) -> Result<Vec<String>, String> {
+    pub(super) fn home_names(&self, owner: u128) -> Result<Vec<String>, String> {
         let err = |e: rusqlite::Error| e.to_string();
         let mut stmt = self
             .conn
@@ -2576,15 +2576,24 @@ fn dir_size(dir: &PathBuf) -> u64 {
     total
 }
 
-/// Formats a byte size as "X.XX MB, X.XX GB, X.XXXXX TB".
+/// I changed this myself, name is misleading lmao
 fn format_size_triplet(bytes: u64) -> String {
     let b = bytes as f64;
-    format!(
-        "{:.2} MB, {:.2} GB, {:.5} TB",
-        b / 1_000_000.0,
-        b / 1_000_000_000.0,
-        b / 1_000_000_000_000.0
-    )
+    let units = [
+        (1_000_000_000_000_000.0, "PB"), // also useless
+        (1_000_000_000_000.0, "TB"),
+        (1_000_000_000.0, "GB"),
+        (1_000_000.0, "MB"),
+        (1_000.0, "KB"), // literally useless
+    ];
+
+    for (divisor, unit) in units {
+        if b >= divisor {
+            return format!("{:.2} {}", b / divisor, unit);
+        }
+    }
+
+    format!("{} B", bytes)
 }
 
 /// Formats a byte size in the most appropriate unit (MB, GB, or TB).

@@ -31,6 +31,7 @@ simulation_distance = 10     # chunks around each player where mobs, crops and r
 max_view_distance = 0        # past view_distance, saved chunks only, up to this (never generated; 0: off)
 admin_feedback_to_ops = true # operators see each other's commands ([name: ...], vanilla); false: only the log
 accept_older_clients = false # true: 26.2 clients join too, their packets translated (docs/hosting.md)
+max_connections_per_ip = 10  # simultaneous connections from one non-local address (status/login/play); 0: no limit
 
 [world]
 name = "world"               # the world folder
@@ -140,7 +141,7 @@ enabled = true               # false pauses it and keeps the webhook
 "##;
 
 /// Each typed setting: its section, its name, and the vanilla key it writes.
-pub(crate) const TYPED: [(&str, &str, &str); 17] = [
+pub(crate) const TYPED: [(&str, &str, &str); 18] = [
     ("server", "motd", "motd"),
     ("server", "port", "server-port"),
     ("server", "bind", "server-ip"),
@@ -160,6 +161,11 @@ pub(crate) const TYPED: [(&str, &str, &str); 17] = [
         "server",
         "accept_older_clients",
         "horizon-accept-older-clients",
+    ),
+    (
+        "server",
+        "max_connections_per_ip",
+        "horizon-max-connections-per-ip",
     ),
     ("world", "name", "level-name"),
     ("world", "seed", "level-seed"),
@@ -464,6 +470,8 @@ pub struct Server {
     /// Whether 26.2 clients may join, their packets translated (horizon-protocol's `ClientSession`); off, they
     /// are turned away as vanilla turns away any other release.
     pub accept_older_clients: bool,
+    /// Simultaneous connections from one non-local/public address (status, login, play). 0 disables the limit.
+    pub max_connections_per_ip: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -694,6 +702,7 @@ impl Default for Server {
             max_view_distance: 0,
             admin_feedback_to_ops: true,
             accept_older_clients: false,
+            max_connections_per_ip: 10,
         }
     }
 }

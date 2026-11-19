@@ -3879,6 +3879,30 @@ impl Game<'_> {
                 suggestions.extend(names.out);
             }
         }
+        // The anarchy extras' commands: home names for /home, /delhome and /sethome.
+        if super::anarchy::ANARCHY_COMMANDS.contains(&label) && self.anarchy_on() {
+            let held = host
+                .hub
+                .guest(conn)
+                .is_some_and(|g| host.hub.login_hold.contains(&g.uuid));
+            if !held
+                && matches!(label, "home" | "delhome" | "sethome")
+                && arguments.len() == 1
+            {
+                if let (Some(anarchy), Some(typed)) =
+                    (self.anarchy.as_ref(), arguments.last().map(String::as_str))
+                {
+                    let arg_start = command.len() - typed.len();
+                    if let Ok(homes) = anarchy.store.home_names(player_uuid) {
+                        let mut home_suggestions =
+                            horizon_client::command::SuggestionsBuilder::new(command, arg_start);
+                        home_suggestions.suggest_matching(homes.iter().map(String::as_str));
+                        suggestions.extend(home_suggestions.out);
+                        (start, end) = (arg_start, command.len());
+                    }
+                }
+            }
+        }
         self.native_tab_complete(
             player_uuid,
             &player_name,
