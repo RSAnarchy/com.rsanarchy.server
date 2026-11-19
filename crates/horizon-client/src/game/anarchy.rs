@@ -307,10 +307,8 @@ pub(super) struct Anarchy {
     held_saves: HashMap<u128, HeldSave>,
     /// Players waiting for a random spawn's chunk to load (the spot is searched each tick).
     pub(super) pending_spawn: Vec<u128>,
-    /// The random spawns ready to use: ground already loaded (`anarchy_fill_spawns`).
-    pub(super) spawn_pool: Vec<[f64; 3]>,
-    /// Columns waiting for their chunk to load so the fill can recheck them.
-    pub(super) spawn_candidates: Vec<[i32; 2]>,
+    /// Random spawn-anchor chunks kept loaded until handed off as a spawn.
+    pub(super) spawn_anchors: Vec<(i32, i32)>,
     /// Ticks of no damage left after a random landing (the reference's nodamagetime).
     pub(super) grace: HashMap<u128, u32>,
     /// Whether a hopper is a dupe hopper, for a few seconds (see `dupe_chain_at`).
@@ -431,17 +429,11 @@ pub(super) const RANDOM_SPAWN_LIFT: f64 = 3.0;
 /// No damage after a random landing: 5 seconds (the reference's nodamagetime).
 pub(super) const RANDOM_SPAWN_GRACE_TICKS: u32 = 100;
 
-/// Ready random spots kept for a respawn or `/rtp` to take at once.
-pub(super) const RANDOM_SPAWN_POOL: usize = 25;
+/// Random spawn-anchor chunks kept loaded and ready to hand off.
+pub(super) const RANDOM_SPAWN_ANCHORS: usize = 10;
 
-/// Column checks the pool fill makes per tick, so a fill never holds up the tick.
-pub(super) const RANDOM_SPAWN_FILL_STEPS: u32 = 8;
-
-/// Extra chunk-load requests the fill may queue in one pass.
-const RANDOM_SPAWN_FILL_LOADS: usize = 8;
-
-/// Loading columns remembered for recheck once their chunks arrive.
-const RANDOM_SPAWN_CANDIDATES: usize = 32;
+/// Ticket radius for each spawn anchor so its area (and trip arrivals) are ready.
+const RANDOM_SPAWN_ANCHOR_RADIUS: i32 = 1;
 
 /// The feet of a random landing on the ground at (x, y, z).
 pub(super) fn landing(x: i32, y: i32, z: i32) -> [f64; 3] {
@@ -564,8 +556,7 @@ impl Game<'_> {
                 held_modes: HashMap::new(),
                 held_saves: HashMap::new(),
                 pending_spawn: Vec::new(),
-                spawn_pool: Vec::new(),
-                spawn_candidates: Vec::new(),
+                spawn_anchors: Vec::new(),
                 grace: HashMap::new(),
                 dupe_cache: HashMap::new(),
                 sessions: HashMap::new(),
@@ -584,68 +575,88 @@ impl Game<'_> {
         }
     }
 
-    /// A random spawn's feet, from the spawn pool. The pool is filled toward the target number of
-    /// ready spots, so a respawn or `/rtp` takes a spot whose ground is already loaded and the
-    /// player moves once. Consuming a spot triggers refill. None while the pool is empty.
-    pub(super) fn anarchy_random_feet(&mut self) -> Option<[f64; 3]> {
-        let pending = self
-            .anarchy
-            .as_ref()
-            .map_or(0, |a| a.pending_spawn.len().min(RANDOM_SPAWN_POOL));
-        let target = RANDOM_SPAWN_POOL + pending;
-        self.anarchy_fill_spawns(target);
-        let spot = self.anarchy.as_mut().and_then(|a| {
-            (!a.spawn_pool.is_empty()).then(|| a.spawn_pool.remove(0))
-        });
-        if spot.is_some() {
-            // Regenerate on use so free ready spots stay available.
-            self.anarchy_fill_spawns(target);
-        }
-        spot
+    /// Extra streaming areas for reserved random-spawn anchor chunks, so they stay loaded until
+    /// handed off as a spawn (a released anchor is then kept loaded by the player's presence).
+    pub(super) fn anarchy_spawn_extra_areas(&self) -> Vec<((i32, i32), i32)> {
+        let Some(anarchy) = &self.anarchy else {
+            return Vec::new();
+        };
+        anarchy
+            .spawn_anchors
+            .iter()
+            .map(|&chunk| (chunk, RANDOM_SPAWN_ANCHOR_RADIUS))
+            .collect()
     }
 
-    /// Fills the spawn pool with spots whose ground is loaded. Loading columns are queued for chunk
-    /// load and remembered for recheck, but the search keeps probing other columns so ready spots can
-    /// be found immediately. The streaming centre is never moved, so players keep their chunks.
-    pub(super) fn anarchy_fill_spawns(&mut self, target: usize) {
+    /// Ensures the random-spawn anchor set has 10 chunks selected in a 50k radius. Anchors are
+    /// kept loaded via `streaming.extra`; once handed off to a player they are removed from the set.
+    pub(super) fn anarchy_ensure_spawn_anchors(&mut self) {
         if self.anarchy.is_none() {
             return;
         }
-        let have = self.anarchy.as_ref().map_or(0, |a| a.spawn_pool.len());
-        if have >= target {
-            return;
+        for _ in 0..RANDOM_SPAWN_ANCHORS * 4 {
+            let len = self.anarchy.as_ref().map_or(0, |a| a.spawn_anchors.len());
+            if len >= RANDOM_SPAWN_ANCHORS {
+                return;
+            }
+            let [x, z] = disc_point(RANDOM_SPAWN_RADIUS, &mut os_unit);
+            let chunk = (x >> 4, z >> 4);
+            if let Some(a) = self.anarchy.as_mut()
+                && !a.spawn_anchors.contains(&chunk)
+            {
+                a.spawn_anchors.push(chunk);
+            }
+        }
+    }
+
+    /// A random spawn's feet from a loaded anchor chunk. Picks a random position inside a ready
+    /// anchor chunk (5x5 area lit for arrivals), hands that anchor off, and refills the set.
+    pub(super) fn anarchy_random_feet(&mut self) -> Option<[f64; 3]> {
+        self.anarchy_ensure_spawn_anchors();
+        if self.anarchy.is_none() {
+            return None;
         }
 
-        let attempts = need.saturating_mul(24).clamp(32, 256) as u32;
-        let mut loads = 0usize;
-
-        // Recheck columns whose chunks may have loaded since last pass.
-        let candidates = self
+        let anchors = self
             .anarchy
-            .as_mut()
-            .map(|a| std::mem::take(&mut a.spawn_candidates))
+            .as_ref()
+            .map(|a| a.spawn_anchors.clone())
             .unwrap_or_default();
-        let mut kept = Vec::with_capacity(candidates.len().min(RANDOM_SPAWN_CANDIDATES));
-        {
-            let world = &self.world;
-            let streaming = &self.streaming;
-            let facts = self.res.facts();
-            let air = world.air;
-            for [x, z] in candidates {
-                let pool_len = self.anarchy.as_ref().map_or(0, |a| a.spawn_pool.len());
-                if pool_len >= target {
-                    if let Some(a) = self.anarchy.as_mut() {
-                        a.spawn_candidates = kept;
-                    }
-                    return;
+        let mut order: Vec<usize> = (0..anchors.len()).collect();
+        // Randomize anchor selection.
+        for i in (1..order.len()).rev() {
+            let mut bytes = [0u8; 8];
+            if getrandom::fill(&mut bytes).is_err() {
+                break;
+            }
+            let j = (u64::from_le_bytes(bytes) as usize) % (i + 1);
+            order.swap(i, j);
+        }
+
+        for idx in order {
+            let chunk = anchors[idx];
+            let (cx, cz) = chunk;
+            if !(-2..=2).all(|dz| (-2..=2).all(|dx| self.streaming.is_lit(cx + dx, cz + dz))) {
+                continue;
+            }
+
+            // Pick the spawn from a random block/column inside that one chunk.
+            let mut found_feet = None;
+            for _ in 0..32 {
+                let mut bytes = [0u8; 2];
+                if getrandom::fill(&mut bytes).is_err() {
+                    bytes = [8, 8];
                 }
-                if !streaming.is_lit(x >> 4, z >> 4) {
-                    if kept.len() < RANDOM_SPAWN_CANDIDATES {
-                        kept.push([x, z]);
-                    }
-                    continue;
-                }
-                let mut found = None;
+                let lx = (bytes[0] & 15) as i32;
+                let lz = (bytes[1] & 15) as i32;
+                let x = cx * 16 + lx;
+                let z = cz * 16 + lz;
+
+                let world = &self.world;
+                let facts = self.res.facts();
+                let air = world.air;
+                let mut ground = None;
+                let mut unsafe_col = false;
                 for y in (world.bottom_y()..world.top_y()).rev() {
                     let state = world.block(x, y, z);
                     if state == air {
@@ -655,76 +666,32 @@ impl Game<'_> {
                     if !matches!(block.fluid, horizon_client::blocks::Fluid::None)
                         || unsafe_ground(&block.name)
                     {
-                        found = Some(None);
+                        unsafe_col = true;
                     } else {
-                        found = Some(Some(y));
+                        ground = Some(y);
                     }
                     break;
                 }
-                match found {
-                    Some(Some(y)) => {
-                        if let Some(a) = self.anarchy.as_mut() {
-                            a.spawn_pool.push(landing(x, y, z));
-                        }
-                    }
-                    Some(None) => {}
-                    None => {}
-                }
-            }
-        }
-        if let Some(a) = self.anarchy.as_mut() {
-            a.spawn_candidates = kept;
-        }
-
-        for _ in 0..attempts {
-            let pool_len = self.anarchy.as_ref().map_or(0, |a| a.spawn_pool.len());
-            if pool_len >= target {
-                break;
-            }
-            let [x, z] = disc_point(RANDOM_SPAWN_RADIUS, &mut os_unit);
-            if !self.streaming.is_lit(x >> 4, z >> 4) {
-                let chunk = (x >> 4, z >> 4);
-                if !self.spawn_wait.contains(&chunk) && loads < RANDOM_SPAWN_FILL_LOADS {
-                    self.spawn_wait.push(chunk);
-                    loads += 1;
-                }
-                if let Some(a) = self.anarchy.as_mut()
-                    && a.spawn_candidates.len() < RANDOM_SPAWN_CANDIDATES
-                    && !a.spawn_candidates.contains(&[x, z])
-                {
-                    a.spawn_candidates.push([x, z]);
-                }
-                continue;
-            }
-            let world = &self.world;
-            let facts = self.res.facts();
-            let air = world.air;
-            let mut ground = None;
-            let mut unsafe_col = false;
-            for y in (world.bottom_y()..world.top_y()).rev() {
-                let state = world.block(x, y, z);
-                if state == air {
+                if unsafe_col {
                     continue;
                 }
-                let block = facts.get(state);
-                if !matches!(block.fluid, horizon_client::blocks::Fluid::None)
-                    || unsafe_ground(&block.name)
-                {
-                    unsafe_col = true;
-                } else {
-                    ground = Some(y);
+                if let Some(y) = ground {
+                    found_feet = Some(landing(x, y, z));
+                    break;
                 }
-                break;
             }
-            if unsafe_col {
-                continue;
-            }
-            if let Some(y) = ground
-                && let Some(a) = self.anarchy.as_mut()
-            {
-                a.spawn_pool.push(landing(x, y, z));
+
+            if let Some(feet) = found_feet {
+                // Hand off this anchor: player presence will keep it loaded now.
+                if let Some(a) = self.anarchy.as_mut() {
+                    a.spawn_anchors.retain(|&c| c != chunk);
+                }
+                self.anarchy_ensure_spawn_anchors();
+                return Some(feet);
             }
         }
+
+        None
     }
 
     /// A player's session begins: first join recorded, the clock for playtime starts.
@@ -1805,14 +1772,8 @@ impl Game<'_> {
                 .interaction_limits
                 .retain(|_, (start, _)| start.elapsed() < Duration::from_secs(2));
         }
-        let online = host.hub.guests.len();
-        let pending = self
-            .anarchy
-            .as_ref()
-            .map_or(0, |a| a.pending_spawn.len());
-        // Keep at least 25 free spots ready, and warm up more for high playercounts/demand.
-        let target = RANDOM_SPAWN_POOL + (online / 2).min(RANDOM_SPAWN_POOL) + pending.min(RANDOM_SPAWN_POOL);
-        self.anarchy_fill_spawns(target);
+        // Keep 10 random spawn-anchor chunks selected/loaded; handoffs consume and refill them.
+        self.anarchy_ensure_spawn_anchors();
         if let Some(anarchy) = self.anarchy.as_mut() {
             anarchy.grace.retain(|_, ticks| {
                 *ticks = ticks.saturating_sub(1);
@@ -1822,33 +1783,43 @@ impl Game<'_> {
                 .pending_spawn
                 .retain(|uuid| host.hub.guests.iter().any(|g| g.uuid == *uuid));
         }
-        // Random spawns waiting on a spot: land queued players as ready spots become available
-        // (a held player waits for the release). Resolve as many as possible this tick so a
-        // respawn that had to fall back to the world spawn is moved quickly once found.
+        // Random spawns waiting on a ready anchor: land queued players as soon as possible
+        // (a held player waits for release). Resolve eligible players while anchors are ready.
         loop {
-            let next = self.anarchy.as_ref().and_then(|a| {
-                a.pending_spawn
-                    .iter()
-                    .copied()
-                    .find(|uuid| !host.hub.login_hold.contains(uuid))
-            });
-            let Some(uuid) = next else {
-                break;
-            };
-            let Some(feet) = self.anarchy_random_feet() else {
-                break;
-            };
-            let Some(i) = host.hub.guests.iter().position(|g| g.uuid == uuid) else {
+            let pending = self
+                .anarchy
+                .as_ref()
+                .map(|a| a.pending_spawn.clone())
+                .unwrap_or_default();
+            let mut progressed = false;
+            for uuid in pending {
+                if host.hub.login_hold.contains(&uuid) {
+                    continue;
+                }
+                let Some(i) = host.hub.guests.iter().position(|g| g.uuid == uuid) else {
+                    if let Some(anarchy) = self.anarchy.as_mut() {
+                        anarchy.pending_spawn.retain(|u| *u != uuid);
+                    }
+                    progressed = true;
+                    continue;
+                };
+                if !host.hub.guests[i].placed || host.hub.guests[i].dead {
+                    continue;
+                }
+                let Some(feet) = self.anarchy_random_feet() else {
+                    progressed = false;
+                    break;
+                };
                 if let Some(anarchy) = self.anarchy.as_mut() {
                     anarchy.pending_spawn.retain(|u| *u != uuid);
                 }
-                continue;
-            };
-            if let Some(anarchy) = self.anarchy.as_mut() {
-                anarchy.pending_spawn.retain(|u| *u != uuid);
+                self.anarchy_grace_start(uuid);
+                host.hub.teleport(i, Some(feet));
+                progressed = true;
             }
-            self.anarchy_grace_start(uuid);
-            host.hub.teleport(i, Some(feet));
+            if !progressed {
+                break;
+            }
         }
         let held: Vec<(u32, u128)> = host
             .hub
@@ -1910,7 +1881,8 @@ impl Game<'_> {
             .set_game_mode(conn, mode, &self.world, Some(self.collision));
         // Back to where they stood before the hold (a new player's random spawn, a
         // returning player's saved spot); else TeleportTransition.createDefault's
-        // world spawn column.
+        // world spawn column. A player queued for a random spawn gets it here if ready,
+        // so release doesn't race with a later pending-spawn teleport.
         let save = self
             .anarchy
             .as_mut()
@@ -1918,12 +1890,29 @@ impl Game<'_> {
         let spot = save
             .filter(|h| h.dimension == host.hub.config.dimension)
             .map(|h| h.position);
-        let at = spot.unwrap_or_else(|| {
-            self.level.world_spawn.map_or(
-                self.spawn.map_or([0.5, 80.0, 0.5], |s| [s.x, s.y, s.z]),
-                |[x, y, z]| [f64::from(x) + 0.5, f64::from(y), f64::from(z) + 0.5],
-            )
-        });
+        let pending = self
+            .anarchy
+            .as_ref()
+            .is_some_and(|a| a.pending_spawn.contains(&uuid));
+        let random = if pending {
+            self.anarchy_random_feet()
+        } else {
+            None
+        };
+        let at = if let Some(feet) = random {
+            if let Some(anarchy) = self.anarchy.as_mut() {
+                anarchy.pending_spawn.retain(|u| *u != uuid);
+            }
+            self.anarchy_grace_start(uuid);
+            feet
+        } else {
+            spot.unwrap_or_else(|| {
+                self.level.world_spawn.map_or(
+                    self.spawn.map_or([0.5, 80.0, 0.5], |s| [s.x, s.y, s.z]),
+                    |[x, y, z]| [f64::from(x) + 0.5, f64::from(y), f64::from(z) + 0.5],
+                )
+            })
+        };
         self.level_teleports.push(LevelTeleport {
             conn,
             dim: Dim::Overworld,

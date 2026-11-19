@@ -4127,6 +4127,8 @@ impl Game<'_> {
             && host.hub.guests[i].spawn.is_none()
             // A random landing is coming: a world-spawn trip would move the player a second time.
             && !self.anarchy_random_pending(host.hub.guests[i].uuid)
+            // Anarchy handles no-bed spawns itself (RTP spot now, or queued pending fallback).
+            && !self.anarchy_on()
         {
             // TeleportTransition.createDefault: no point of its own, so the
             // world spawn's free column once its chunks have loaded.

@@ -543,9 +543,10 @@ impl Shared {
         self.online.lock().unwrap().iter().any(|(u, _)| *u == uuid)
     }
     pub fn motd(&self) -> String {
-        self.motd.lock().unwrap().clone()
+        rotating_rsanarchy_motd(|bound| self.next_random(bound))
     }
     pub fn set_motd(&self, motd: String) {
+        // RSAnarchy uses rotating MOTDs for status responses; keep last configured value.
         *self.motd.lock().unwrap() = motd;
     }
     pub fn max_players(&self) -> usize {
@@ -599,7 +600,7 @@ impl Shared {
     /// [`Self::status_json`] stating `protocol`: an older client's own, when it may join.
     pub fn status_json_for(&self, protocol: i32) -> String {
         use crate::server::json::Json;
-        let motd = self.motd.lock().unwrap().clone();
+        let motd = self.motd();
         let online: Vec<(u128, String)> = self.online.lock().unwrap().clone();
         let count = self.online();
         let mut players = vec![
@@ -1075,6 +1076,98 @@ pub fn available_port() -> u16 {
 /// Same-machine harnesses opt in; real LAN runs keep the normal network interfaces.
 pub(super) fn test_loopback() -> bool {
     std::env::var_os("HORIZON_TEST_LOOPBACK").is_some_and(|v| v == "1")
+}
+
+fn rotating_rsanarchy_motd(mut rand: impl FnMut(usize) -> usize) -> String {
+    const HEADER: &str = "\u{00A7}6\u{00A7}l.RS Anarchy \u{00A7}8- \u{00A7}726.3 cracked anarchy\u{00A7}r\n\u{00A7}f";
+    // REALLY REALLY rare (about ~0.05% each per status response).
+    if rand(4000) == 0 {
+        return "\u{00A7}3Endcrystal.me\u{00A7}7 - \u{00A7}6\u{00A7}l1.21 \u{00A7}6anarchy\u{00A7}r\n\u{00A7}fdupe disabled till 2026".to_owned();
+    }
+    if rand(3999) == 0 {
+        return "RSAnarchy - im tired of writing these motds boss".to_owned();
+    }
+
+    let regular: &[&str] = &[
+        "Built on rust!",
+        "__COLORMATIC__",
+        "rip to ecme",
+        "est Aug 8th 2026",
+        "updating to 1.7.2 soon!",
+        "its cracked?",
+        "wait is this motd goated?",
+        "oldest rust anarchy server in Minecraft",
+        "Rust > Folia",
+        "Hello?",
+        "a really bad idea",
+        "uni.bat included",
+        "$r77-minecraft.exe",
+        "performant or something",
+        "hey dont say that",
+        "frikkin E. Z.",
+        "built in C#",
+        "made in unity!",
+        "this beat is terrible",
+        "im tired of writing motds boss :sob:",
+        "1.12.2 lol",
+        "vibecoded by GPT-2",
+        "i think it was at -59158 68 16811 or something",
+        "i love rust if you couldnt tell",
+        "use playhorizon.dev!",
+        "use a rust client bro!",
+        "50k rtp radius! (seriously)",
+        "50k rtp radius???",
+        "heavily untested",
+        "what is a 'Backups'?",
+        "how to port forwards",
+        "the nether is still faster",
+        "borders broken",
+        "chunks in .linear!",
+        "its all probably skidded anyways",
+        "True Anarchy",
+        "factions update 2029",
+        "im going to break my monitor i swear",
+        "/rtp now",
+        "i hate it",
+        "/rtp FASTER",
+        "idc if you dont  likiekef like isjod",
+        "ledger larper",
+        "free ram @ libil2cpp.so",
+        "eat, fortnite, sleep, repeat",
+        "your granted fortnite pirate token access",
+        "base security is a personal project",
+        "i dont have a alibis",
+        "fukit",
+        "no resets scheduled",
+        "broken",
+        "originally a 1.16 server!",
+        "yeah but its in rust!",
+        "made out of pure boredom",
+        "420blazeit",
+        "you can always walk farther",
+        "farlands energy, modern version",
+        "i think it was anarchy or something",
+        "pastebin.com/fa8vba5K || BSANaDL3RL",
+        "takes more ram than ai!",
+        "Storm_Splurge ruined the server",
+        "balright",
+        "Hey claude make me $100,000,000,000,000 ideas no mistake......",
+        "Hey claude rewrite minecraft in rust no mistakes.",
+    ];
+
+    let line = regular[rand(regular.len())];
+    if line == "__COLORMATIC__" {
+        const COLORS: &[char] = &['1', '2', '3', '4', '5', '6', '9', 'a', 'b', 'c', 'd', 'e', 'f'];
+        let mut out = String::from(HEADER);
+        for ch in "COLORMATIC!".chars() {
+            out.push('\u{00A7}');
+            out.push(COLORS[rand(COLORS.len())]);
+            out.push(ch);
+        }
+        return out;
+    }
+
+    format!("{HEADER}{line}")
 }
 
 #[cfg(test)]
